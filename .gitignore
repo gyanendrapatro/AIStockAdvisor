@@ -5,5 +5,12 @@ __pycache__/
 .ruff_cache/
 .env
 /reports/
-/data/
+/data/*
+!/data/*.csv
+!/data/sectors/
+!/data/sectors/**
+/data/advisor.sqlite
+/data/daily_refresh_report.json
+/data/.DS_Store
+/data/**/.DS_Store
 .DS_Store
