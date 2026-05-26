@@ -22,21 +22,72 @@ Personal daily stock suggestion system for Indian and US stocks with no paid API
 - Provides a Streamlit dashboard
 - Exposes MCP tools for Codex, Gemini, Claude, Cursor, etc.
 
-## Quick start
+## Install
 
 ```bash
+git clone git@github.com:gyanendrapatro/AIStockAdvisor.git
+cd AIStockAdvisor
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env
-PYTHONPATH=src python -m stock_advisor.cli scan
-streamlit run src/stock_advisor/dashboard/app.py
 ```
 
-For local source layout:
+Use `requirements.txt` for app/runtime only, or `requirements-dev.txt` when you
+also want to run tests. Because this repo uses a local `src/` layout, either
+prefix commands with `PYTHONPATH=src` or export it once:
 
 ```bash
 export PYTHONPATH=src
+```
+
+Optional `.env` values:
+
+```bash
+SEC_USER_AGENT=ai-stock-advisor-mcp/0.1 your-email@example.com
+DHAN_ACCESS_TOKEN=
+DHAN_CLIENT_ID=
+OWNERSHIP_DATA_PATH=ownership.yaml
+STOOQ_API_KEY=
+```
+
+`data/sectors/**` and the seed universe CSVs are committed so a fresh clone can
+run sector, industry, RRG, and top-gainer views immediately. Runtime cache files
+such as `data/advisor.sqlite` and `data/daily_refresh_report.json` are generated
+locally and are intentionally not committed.
+
+## Run the UI
+
+Start the Streamlit dashboard:
+
+```bash
+cd AIStockAdvisor
+source .venv/bin/activate
+export PYTHONPATH=src
+streamlit run src/stock_advisor/dashboard/app.py
+```
+
+Open the URL Streamlit prints, usually:
+
+```text
+http://localhost:8501
+```
+
+Main UI tabs:
+
+- `Stock Scan`: analyze one stock or rank configured watchlists.
+- `Sector Analytics`: ChartsMaze-style sector breadth from `data/sectors` plus fresh/cached prices.
+- `RRG`: sector relative rotation graph versus Nifty 50.
+- `Industry Analytics`: industry performance and stock drill-downs.
+- `Market Indices`, `Market Breadth`, `Top Gainers`: broader market dashboards.
+- `Universe`: audit stock membership and run the daily NSE/BSE refresh manually.
+
+## Quick CLI Checks
+
+```bash
+PYTHONPATH=src .venv/bin/python -m stock_advisor.cli scan --group india --limit 5
+PYTHONPATH=src .venv/bin/python -m stock_advisor.cli analyze ANANTRAJ.NS --period 1y --deep-research
+PYTHONPATH=src .venv/bin/python -m stock_advisor.cli refresh-data --max-price-symbols 100
 ```
 
 ## Free-Only Data Model
@@ -165,11 +216,22 @@ control. Rotate the token if it was pasted into chat or logs.
 The MCP deliberately does not expose order placement, order modification, exit
 position, or trade execution tools.
 
-## MCP server
+## MCP Server
+
+The MCP server exposes the same analysis engine to agents such as Codex, Claude,
+Cursor, Gemini-compatible clients, and any tool runner that supports MCP.
+
+Start it manually:
 
 ```bash
-python -m stock_advisor.mcp.server
+cd AIStockAdvisor
+source .venv/bin/activate
+PYTHONPATH=src python -m stock_advisor.mcp.server
 ```
+
+When configured in an MCP client, the client starts this command automatically
+when an agent needs a tool call. You do not normally keep a separate terminal
+open unless you are debugging.
 
 Example MCP tools:
 
@@ -218,25 +280,6 @@ Example MCP tools:
 - `market_snapshot`
 - `generate_daily_report`
 
-Typical MCP startup command:
-
-```bash
-cd /path/to/ai-stock-advisor
-source .venv/bin/activate
-PYTHONPATH=src python -m stock_advisor.mcp.server
-```
-
-Portfolio analysis should be done through MCP tool calls, not by importing the
-Python modules directly from the agent. The intended flow is:
-
-```text
-agent -> MCP client -> ai-stock-advisor MCP server -> Dhan/read-only data + analysis tools
-```
-
-For a connected Dhan account, call `analyze_dhan_portfolio` from the MCP client.
-That tool fetches holdings through Dhan, analyzes each equity holding, preserves
-cash-like holdings such as `LIQUIDCASE`, and returns add/hold/reduce buckets.
-
 Verify MCP wiring locally:
 
 ```bash
@@ -248,8 +291,30 @@ PYTHONPATH=src .venv/bin/python scripts/check_mcp_setup.py --portfolio
 The verifier starts the server through an MCP client and calls MCP tools. It
 does not print your Dhan token.
 
-For MCP clients that accept JSON server config, copy `mcp-config.example.json`
-into the client configuration and update `SEC_USER_AGENT` with your email:
+## Configure MCP In Agents
+
+For MCP clients that accept JSON server config, add this `mcpServers` block.
+Update the paths if you cloned somewhere else:
+
+```json
+{
+  "mcpServers": {
+    "ai-stock-advisor": {
+      "command": "/absolute/path/to/AIStockAdvisor/.venv/bin/python",
+      "args": ["-m", "stock_advisor.mcp.server"],
+      "env": {
+        "PYTHONPATH": "/absolute/path/to/AIStockAdvisor/src",
+        "SEC_USER_AGENT": "ai-stock-advisor-mcp/0.1 your-email@example.com",
+        "OWNERSHIP_DATA_PATH": "ownership.yaml",
+        "DHAN_ACCESS_TOKEN": "",
+        "DHAN_CLIENT_ID": ""
+      }
+    }
+  }
+}
+```
+
+For this local machine, the current repo path is:
 
 ```json
 {
@@ -268,6 +333,32 @@ into the client configuration and update `SEC_USER_AGENT` with your email:
   }
 }
 ```
+
+Where to put it depends on the client:
+
+- Codex/agent clients: add the server through the app's MCP/server settings or the client config file.
+- Claude Desktop: add it under `mcpServers` in the Claude Desktop config.
+- Cursor: add it to the project/global MCP config.
+- Other agents: use the same command, args, and env block wherever that client accepts MCP servers.
+
+After configuration, ask the agent to call `server_info` or `health_check` from
+`ai-stock-advisor`. If that works, the agent can call tools such as
+`analyze_stock`, `get_sector_analytics`, `get_relative_rotation_graph`,
+`get_top_gainers`, and `analyze_dhan_portfolio`.
+
+Portfolio analysis should be done through MCP tool calls, not by importing the
+Python modules directly from the agent. The intended flow is:
+
+```text
+agent -> MCP client -> ai-stock-advisor MCP server -> Dhan/read-only data + analysis tools
+```
+
+For a connected Dhan account, call `analyze_dhan_portfolio` from the MCP client.
+That tool fetches holdings through Dhan, analyzes each equity holding, preserves
+cash-like holdings such as `LIQUIDCASE`, and returns add/hold/reduce buckets.
+
+`mcp-config.example.json` contains the same config shape and can be copied into
+any MCP client that accepts JSON config.
 
 Useful CLI examples:
 
