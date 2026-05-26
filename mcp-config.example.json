@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "ai-stock-advisor": {
+      "command": "/Users/gypatro/Downloads/ai-stock-advisor/.venv/bin/python",
+      "args": ["-m", "stock_advisor.mcp.server"],
+      "env": {
+        "PYTHONPATH": "/Users/gypatro/Downloads/ai-stock-advisor/src",
+        "SEC_USER_AGENT": "ai-stock-advisor-mcp/0.1 your-email@example.com",
+        "OWNERSHIP_DATA_PATH": "ownership.yaml",
+        "DHAN_ACCESS_TOKEN": "",
+        "DHAN_CLIENT_ID": ""
+      }
+    }
+  }
+}

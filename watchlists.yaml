@@ -1,0 +1,16 @@
+india:
+  - RELIANCE.NS
+  - TCS.NS
+  - INFY.NS
+  - HDFCBANK.NS
+  - ICICIBANK.NS
+  - SBIN.NS
+  - LT.NS
+us:
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - GOOGL
+  - META
+  - TSLA

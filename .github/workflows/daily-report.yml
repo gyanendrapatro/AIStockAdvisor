@@ -1,0 +1,20 @@
+name: Daily Stock Report
+on:
+  schedule:
+    - cron: "30 3 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: PYTHONPATH=src python -m stock_advisor.cli report
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daily-report
+          path: reports/*.md

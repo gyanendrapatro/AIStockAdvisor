@@ -1,0 +1,28 @@
+# Optional local ownership/governance data.
+# Copy to ownership.yaml or set OWNERSHIP_DATA_PATH to your YAML/CSV file.
+# Values are percentages unless noted otherwise.
+#
+# You can manually enter data from official NSE/BSE filings, company investor
+# relations pages, or your personal Screener export. The app does not scrape
+# Screener directly.
+
+RELIANCE.NS:
+  history:
+    - quarter: "2025-12"
+      promoter_holding: 50.1
+      promoter_pledge: 1.5
+      fii_holding: 18.0
+      dii_holding: 12.0
+      mf_holding: 8.0
+      public_holding: 20.0
+      shareholder_count: 1000000
+      source: "manual"
+    - quarter: "2026-03"
+      promoter_holding: 51.3
+      promoter_pledge: 0.0
+      fii_holding: 19.2
+      dii_holding: 12.5
+      mf_holding: 8.2
+      public_holding: 17.0
+      shareholder_count: 1100000
+      source: "manual"
