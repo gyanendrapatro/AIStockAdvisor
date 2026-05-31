@@ -1029,6 +1029,9 @@ def _apply_sector_csv_taxonomy(df: pd.DataFrame, *, restrict_to_taxonomy: bool =
     out = df.copy()
     if "classification_source" not in out.columns:
         out["classification_source"] = None
+    for column in ["symbol", "ticker", "sector", "industry", "basic_industry", "classification_source"]:
+        if column in out.columns:
+            out[column] = out[column].astype("object")
     if "symbol" not in out.columns:
         out["symbol"] = out.get("ticker", "").map(lambda value: _taxonomy_symbol(str(value).replace(".NS", "")))
 

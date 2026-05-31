@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 
 from stock_advisor.analysis.chart_patterns import detect_chart_patterns
-from stock_advisor.analysis.indicators import latest_indicators
+from stock_advisor.analysis.indicators import add_indicators, latest_indicators
 from stock_advisor.analysis.sector_rotation import (
     BENCHMARK_TICKER,
     SECTOR_DEFINITIONS,
@@ -27,7 +27,7 @@ from stock_advisor.data.universe import list_universe_industry_definitions, load
 
 MIN_SECTOR_STOCKS_FOR_RANKING = 5
 NON_RANKING_SECTORS = {"Others", "Unclassified"}
-SECTOR_ANALYTICS_VERSION = "sector_analytics_click_drilldown_v4"
+SECTOR_ANALYTICS_VERSION = "sector_analytics_industry_detail_v5"
 RS_RATING_MIN = 1
 RS_RATING_MAX = 99
 RS_RATING_WEIGHTS = (
@@ -39,6 +39,7 @@ RS_RATING_WEIGHTS = (
 RRG_RATIO_LOOKBACK = 22
 RRG_MOMENTUM_LOOKBACK = 8
 RRG_SMOOTH_PERIOD = 9
+RRG_MIN_HISTORY_POINTS = RRG_RATIO_LOOKBACK + RRG_MOMENTUM_LOOKBACK + RRG_SMOOTH_PERIOD
 
 
 INDUSTRY_DEFINITIONS: dict[str, dict[str, Any]] = {
@@ -1155,6 +1156,136 @@ def get_market_breadth(
     )
 
 
+def get_moving_average_crossover_scan(
+    *,
+    period: str = "2y",
+    interval: str = "1d",
+    universe: str = "full_nse",
+    direction: str = "bullish",
+    lookback_periods: int = 20,
+    min_market_cap_cr: float = 0.0,
+    max_rows: int = 150,
+    refresh_universe: bool = False,
+    force_refresh_prices: bool = True,
+    max_universe_stocks: int | None = None,
+) -> dict[str, Any]:
+    """Scan the selected universe for fresh 50-DMA / 200-DMA crossover events."""
+    normalized_universe = _normalize_universe(universe)
+    normalized_direction = _normalize_crossover_direction(direction)
+    warnings: list[str] = []
+
+    if normalized_universe == "local":
+        records = _local_universe_records()
+        universe_refreshed_at = None
+        universe_source = "Configured local industry baskets"
+    else:
+        universe_df = load_stock_universe(
+            universe=normalized_universe,
+            refresh=refresh_universe,
+            max_stocks=max_universe_stocks,
+        )
+        if universe_df.empty:
+            records = _local_universe_records()
+            universe_refreshed_at = None
+            universe_source = "Configured local industry baskets fallback"
+            warnings.append("Requested stock universe was unavailable; fell back to configured local baskets.")
+        else:
+            records = universe_df.to_dict(orient="records")
+            universe_refreshed_at = _latest_universe_refresh(universe_df)
+            universe_source = (
+                "Local data/sectors CSV taxonomy + free NSE/BSE/Yahoo price history"
+                if normalized_universe == "full_nse"
+                else "NSE/BSE public universe metadata + free NSE/BSE/Yahoo price history"
+            )
+
+    if max_universe_stocks is not None and normalized_universe == "local":
+        records = records[: max(0, int(max_universe_stocks))]
+
+    tickers = [str(record.get("ticker") or "").strip().upper() for record in records if str(record.get("ticker") or "").strip()]
+    price_map = get_price_histories(tickers, period=period, interval=interval, force_refresh=force_refresh_prices)
+
+    source_rows: list[dict[str, Any]] = []
+    signal_rows: list[dict[str, Any]] = []
+    for record in records:
+        ticker = str(record.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        prices = price_map.get(ticker)
+        metrics = _price_metrics(prices)
+        if not metrics:
+            continue
+
+        row = _snapshot_stock_row(record)
+        row.update(metrics)
+        row["market_cap_cr"] = _market_cap_crore(record.get("free_float_market_cap"))
+        event = _latest_50_200_crossover_event(
+            prices,
+            direction=normalized_direction,
+            lookback_periods=lookback_periods,
+        )
+        if event:
+            row.update(event)
+        source_rows.append(row)
+
+    _apply_percentile_rs_ratings(source_rows)
+
+    min_market_cap = max(0.0, float(min_market_cap_cr or 0.0))
+    for row in source_rows:
+        if not row.get("has_50_200_cross"):
+            continue
+        market_cap = _number(row.get("market_cap_cr"), None)
+        if min_market_cap and market_cap is not None and market_cap < min_market_cap:
+            continue
+        signal_rows.append(_ma_crossover_display_row(row))
+
+    signal_rows = sorted(
+        signal_rows,
+        key=lambda row: (
+            _number(row.get("periods_since_cross"), 9999),
+            -_number(row.get("rs_rating"), 0),
+            -_number(row.get("return_since_cross_pct"), -999),
+        ),
+    )
+    limited_rows = signal_rows[: max(1, int(max_rows))]
+    sector_summary = _ma_crossover_group_summary(signal_rows, "sector")
+    industry_summary = _ma_crossover_group_summary(signal_rows, "industry")
+
+    eligible_rows = [
+        row
+        for row in source_rows
+        if _number(row.get("sma_50"), None) is not None and _number(row.get("sma_200"), None) is not None
+    ]
+    return _json_safe(
+        {
+            "period": period,
+            "interval": interval,
+            "universe": normalized_universe,
+            "universe_source": universe_source,
+            "universe_refreshed_at": universe_refreshed_at,
+            "universe_stock_count": len(records),
+            "price_data_stock_count": len(source_rows),
+            "eligible_stock_count": len(eligible_rows),
+            "signal_stock_count": len(signal_rows),
+            "returned_stock_count": len(limited_rows),
+            "direction": normalized_direction,
+            "lookback_periods": max(1, int(lookback_periods)),
+            "min_market_cap_cr": min_market_cap,
+            "force_refresh_prices": force_refresh_prices,
+            "price_history_end_date": _latest_stock_date(source_rows),
+            "stocks": limited_rows,
+            "sector_summary": sector_summary,
+            "industry_summary": industry_summary,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "warnings": warnings,
+            "methodology": (
+                "Calculates 50-day and 200-day simple moving averages from the selected universe's daily price history. "
+                "A bullish crossover is counted when 50-DMA moves from at/below 200-DMA to above it; a bearish crossover is the reverse. "
+                "Rows are limited to crosses inside the selected lookback window and are ranked by recency, RS rating, and return since cross."
+            ),
+        }
+    )
+
+
 def get_top_gainers(
     *,
     period: str = "1y",
@@ -1405,6 +1536,7 @@ def get_relative_rotation_graph(
             prices,
             benchmark_close,
             trail_length=trail_length,
+            interval=interval,
         )
         if not trail_points:
             warnings.append(f"No RRG trail could be calculated for {definition['name']}.")
@@ -1918,6 +2050,8 @@ def _sector_strong_stocks(stock_rows: list[dict[str, Any]], mode: str, *, max_st
             "criterion": row.get("criterion_label"),
             "criterion_value": row.get("criterion_value"),
             "rs_rating": row.get("rs_rating"),
+            "return_1d_pct": round(100 * _number(row.get("return_1d"), 0), 2),
+            "return_5d_pct": round(100 * _number(row.get("return_5d"), 0), 2),
             "return_20d_pct": round(100 * _number(row.get("return_20d")), 2),
             "return_60d_pct": round(100 * _number(row.get("return_60d")), 2),
             "sma_20": row.get("sma_20"),
@@ -2004,6 +2138,183 @@ def _normalize_universe(universe: str) -> str:
     if key in {"broad", "nse", "nse_total_market", "nifty_total_market", "total_market"}:
         return "broad"
     return "local"
+
+
+def _normalize_crossover_direction(direction: str) -> str:
+    key = str(direction or "bullish").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "bull": "bullish",
+        "bullish": "bullish",
+        "golden": "bullish",
+        "golden_cross": "bullish",
+        "50_above_200": "bullish",
+        "bear": "bearish",
+        "bearish": "bearish",
+        "death": "bearish",
+        "death_cross": "bearish",
+        "50_below_200": "bearish",
+        "both": "both",
+        "all": "both",
+        "any": "both",
+    }
+    if key not in aliases:
+        raise ValueError("direction must be bullish, bearish, or both.")
+    return aliases[key]
+
+
+def _local_universe_records() -> list[dict[str, Any]]:
+    rows = []
+    for ticker, meta in _ticker_metadata().items():
+        industry = meta.get("industry") or "Unclassified"
+        sector = meta.get("sector") or "Unclassified"
+        rows.append(
+            {
+                "ticker": ticker,
+                "symbol": ticker.replace(".NS", "").replace(".BO", ""),
+                "name": None,
+                "sector": sector,
+                "industry": industry,
+                "basic_industry": industry,
+                "active": True,
+                "free_float_market_cap": None,
+                "source": "local_static_group",
+                "classification_source": "local_static_group",
+                "refreshed_at": None,
+            }
+        )
+    return rows
+
+
+def _latest_50_200_crossover_event(
+    df: pd.DataFrame | None,
+    *,
+    direction: str,
+    lookback_periods: int,
+) -> dict[str, Any]:
+    if df is None or df.empty or "close" not in df.columns:
+        return {}
+    clean = df.dropna(subset=["close"]).copy()
+    if len(clean) < 200:
+        return {}
+
+    indicators = add_indicators(clean)
+    required = {"close", "sma_50", "sma_200", "sma_50_200_cross"}
+    if not required.issubset(indicators.columns):
+        return {}
+    indicators = indicators.dropna(subset=["close", "sma_50", "sma_200"]).reset_index(drop=True)
+    if indicators.empty:
+        return {}
+
+    signal_values = {"bullish": {1}, "bearish": {-1}, "both": {1, -1}}[direction]
+    lookback = max(1, int(lookback_periods or 1))
+    scan = indicators.tail(lookback).copy()
+    signals = pd.to_numeric(scan["sma_50_200_cross"], errors="coerce")
+    matches = scan[signals.isin(signal_values)]
+    if matches.empty:
+        return {}
+
+    event = matches.iloc[-1]
+    latest = indicators.iloc[-1]
+    event_position = int(matches.index[-1])
+    signal_value = int(_number(event.get("sma_50_200_cross"), 0))
+    latest_sma_50 = _number(latest.get("sma_50"), None)
+    latest_sma_200 = _number(latest.get("sma_200"), None)
+    event_sma_50 = _number(event.get("sma_50"), None)
+    event_sma_200 = _number(event.get("sma_200"), None)
+    latest_close = _number(latest.get("close"), None)
+    event_close = _number(event.get("close"), None)
+    return_since_cross = None
+    if latest_close is not None and event_close not in {None, 0}:
+        return_since_cross = round(latest_close / event_close - 1, 4)
+
+    return {
+        "has_50_200_cross": True,
+        "cross_direction": "bullish" if signal_value == 1 else "bearish",
+        "cross_signal": "Golden Cross" if signal_value == 1 else "Death Cross",
+        "cross_date": _row_iso_date(event),
+        "periods_since_cross": max(0, len(indicators) - 1 - event_position),
+        "cross_close": event_close,
+        "cross_sma_50": event_sma_50,
+        "cross_sma_200": event_sma_200,
+        "cross_sma_gap_pct": _ma_gap_pct(event_sma_50, event_sma_200),
+        "latest_sma_gap_pct": _ma_gap_pct(latest_sma_50, latest_sma_200),
+        "latest_50_200_state": "50-DMA above 200-DMA"
+        if latest_sma_50 is not None and latest_sma_200 is not None and latest_sma_50 > latest_sma_200
+        else "50-DMA below 200-DMA",
+        "return_since_cross": return_since_cross,
+    }
+
+
+def _row_iso_date(row: pd.Series) -> str | None:
+    if "date" not in row:
+        return None
+    value = pd.to_datetime(row.get("date"), errors="coerce")
+    if pd.isna(value):
+        return None
+    return value.date().isoformat()
+
+
+def _ma_gap_pct(fast: Any, slow: Any) -> float | None:
+    fast_value = _number(fast, None)
+    slow_value = _number(slow, None)
+    if fast_value is None or slow_value in {None, 0}:
+        return None
+    return round(100 * (fast_value / slow_value - 1), 2)
+
+
+def _ma_crossover_display_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ticker": row.get("ticker"),
+        "symbol": row.get("symbol"),
+        "name": row.get("name"),
+        "sector": row.get("sector"),
+        "industry": row.get("industry"),
+        "market_cap_cr": row.get("market_cap_cr"),
+        "signal": row.get("cross_signal"),
+        "direction": row.get("cross_direction"),
+        "cross_date": row.get("cross_date"),
+        "periods_since_cross": row.get("periods_since_cross"),
+        "latest_date": row.get("latest_date"),
+        "close": row.get("close"),
+        "cross_close": row.get("cross_close"),
+        "return_since_cross_pct": round(100 * _number(row.get("return_since_cross")), 2),
+        "sma_50": row.get("sma_50"),
+        "sma_200": row.get("sma_200"),
+        "sma_gap_pct": row.get("latest_sma_gap_pct"),
+        "cross_sma_gap_pct": row.get("cross_sma_gap_pct"),
+        "current_state": row.get("latest_50_200_state"),
+        "rs_rating": row.get("rs_rating"),
+        "return_20d_pct": round(100 * _number(row.get("return_20d")), 2),
+        "return_60d_pct": round(100 * _number(row.get("return_60d")), 2),
+        "above_sma_50": row.get("above_sma_50"),
+        "above_sma_200": row.get("above_sma_200"),
+        "provider": row.get("provider"),
+        "data_points": row.get("data_points"),
+    }
+
+
+def _ma_crossover_group_summary(rows: list[dict[str, Any]], group_key: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get(group_key) or "Unclassified")].append(row)
+    output = []
+    for group, group_rows in grouped.items():
+        bullish = [row for row in group_rows if row.get("direction") == "bullish"]
+        bearish = [row for row in group_rows if row.get("direction") == "bearish"]
+        dates = [str(row.get("cross_date")) for row in group_rows if row.get("cross_date")]
+        output.append(
+            {
+                group_key: group,
+                "signal_count": len(group_rows),
+                "bullish_count": len(bullish),
+                "bearish_count": len(bearish),
+                "avg_rs_rating": round(_average(row.get("rs_rating") for row in group_rows), 2),
+                "avg_return_since_cross_pct": round(_average(row.get("return_since_cross_pct") for row in group_rows), 2),
+                "latest_cross_date": max(dates) if dates else None,
+                "top_stock": group_rows[0].get("ticker"),
+            }
+        )
+    return sorted(output, key=lambda row: (row["signal_count"], row["avg_rs_rating"]), reverse=True)
 
 
 def _normalize_ma_period(ma_period: int) -> int:
@@ -2416,7 +2727,7 @@ def _normalize_rrg_zones(zone: list[str] | str | None) -> set[str]:
 
 def _rrg_price_history(definition: dict[str, Any], *, period: str, interval: str, force_refresh_prices: bool = True) -> pd.DataFrame:
     prices = _get_index_price_history(definition, period=period, interval=interval)
-    if len(_rrg_close_series(prices)) > 60:
+    if len(_rrg_close_series(prices)) > RRG_MIN_HISTORY_POINTS:
         prices.attrs["rrg_price_method"] = "index_ticker"
         return prices
     proxy = _rrg_equal_weight_proxy(definition.get("stocks", ()), period=period, interval=interval, force_refresh_prices=force_refresh_prices)
@@ -2450,7 +2761,7 @@ def _rrg_equal_weight_proxy(
     series = []
     for ticker in tickers:
         close = _rrg_close_series(get_price_history(ticker, period=period, interval=interval, force_refresh=force_refresh_prices))
-        if len(close) <= 60:
+        if len(close) <= RRG_MIN_HISTORY_POINTS:
             continue
         first = _number(close.iloc[0], None)
         if first is None or first <= 0:
@@ -2495,12 +2806,13 @@ def _rrg_sector_trail(
     benchmark_close: pd.Series,
     *,
     trail_length: int,
+    interval: str,
 ) -> list[dict[str, Any]]:
     sector_close = _rrg_close_series(prices)
     if sector_close.empty or benchmark_close.empty:
         return []
     aligned = pd.concat({"sector": sector_close, "benchmark": benchmark_close}, axis=1).dropna()
-    min_points = RRG_RATIO_LOOKBACK + RRG_MOMENTUM_LOOKBACK + RRG_SMOOTH_PERIOD
+    min_points = RRG_MIN_HISTORY_POINTS
     if len(aligned) <= min_points:
         return []
 
@@ -2520,12 +2832,13 @@ def _rrg_sector_trail(
         return []
 
     start_index = max(0, len(indicators) - trail_length)
+    short_periods, long_periods = _rrg_relative_return_windows(interval)
     trail = []
     for index in range(start_index, len(indicators)):
         date_value = indicators.index[index]
         history_window = aligned.loc[:date_value]
-        rs_20d = _rrg_relative_return(history_window, 20)
-        rs_60d = _rrg_relative_return(history_window, 60)
+        rs_20d = _rrg_relative_return(history_window, short_periods)
+        rs_60d = _rrg_relative_return(history_window, long_periods)
         if rs_20d is None or rs_60d is None:
             continue
         ratio_value = float(indicators["rs_ratio"].iloc[index])
@@ -2545,6 +2858,15 @@ def _rrg_sector_trail(
             }
         )
     return trail
+
+
+def _rrg_relative_return_windows(interval: str) -> tuple[int, int]:
+    normalized = str(interval or "").strip().lower()
+    if normalized in {"1wk", "1w", "weekly"}:
+        return 4, 13
+    if normalized in {"1mo", "1m", "monthly"}:
+        return 1, 3
+    return 20, 60
 
 
 def _rrg_relative_return(window: pd.DataFrame, periods: int) -> float | None:

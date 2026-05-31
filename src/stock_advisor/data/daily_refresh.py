@@ -6,11 +6,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from stock_advisor.config.settings import PROJECT_ROOT
+from stock_advisor.data.exchange_eod import clear_exchange_eod_fetch_cache
 from stock_advisor.data.market_data import (
     get_price_cache_status,
     refresh_latest_exchange_eod_cache,
     warm_price_history_cache,
 )
+from stock_advisor.data.nse_indices import clear_nse_index_archive_cache, get_nse_index_price_history
 from stock_advisor.data.universe import (
     DEFAULT_NSE_INDEX_NAME,
     list_stock_universe,
@@ -34,6 +36,7 @@ def run_daily_market_data_refresh(
     refresh_india_universe: bool = False,
     warm_price_cache: bool = True,
     refresh_exchange_eod: bool = True,
+    warm_index_cache: bool = True,
     warm_universe: str = "full_nse",
     index_name: str = DEFAULT_NSE_INDEX_NAME,
     period: str = "2y",
@@ -50,12 +53,16 @@ def run_daily_market_data_refresh(
     The daily path does three separate jobs:
     1. refreshes public universe files, including NSE equity masters;
     2. pulls the latest official NSE/BSE EOD bhavcopy row into SQLite;
-    3. warms longer OHLCV history so sector, RRG, and stock analytics run fast.
+    3. warms official NSE index-close archives used by RRG and index views;
+    4. warms longer OHLCV history so sector, RRG, and stock analytics run fast.
     """
     started_at = datetime.now(timezone.utc)
     output_path = Path(report_path) if report_path is not None else DEFAULT_DAILY_REFRESH_REPORT_PATH
     steps: dict[str, Any] = {}
     warnings: list[str] = []
+
+    clear_exchange_eod_fetch_cache()
+    clear_nse_index_archive_cache()
 
     if refresh_universes:
         if refresh_broad_universe:
@@ -82,10 +89,15 @@ def run_daily_market_data_refresh(
     if refresh_exchange_eod and tickers:
         exchange_eod_result = refresh_latest_exchange_eod_cache(
             tickers,
-            interval=interval,
+            interval="1d",
             period="1d",
         )
         steps["exchange_eod_cache"] = {"status": "ok", "result": exchange_eod_result}
+
+    index_warm_result: dict[str, Any] | None = None
+    if warm_index_cache:
+        index_warm_result = _warm_index_history_cache(period=period, interval=interval)
+        steps["index_history_cache"] = {"status": "ok", "result": index_warm_result}
 
     price_warm_result: dict[str, Any] | None = None
     if warm_price_cache and tickers:
@@ -118,6 +130,7 @@ def run_daily_market_data_refresh(
             "refresh_india_universe": refresh_india_universe,
             "warm_price_cache": warm_price_cache,
             "refresh_exchange_eod": refresh_exchange_eod,
+            "warm_index_cache": warm_index_cache,
             "max_universe_symbols": max_universe_symbols,
             "max_price_symbols": max_price_symbols,
             "chunk_size": chunk_size,
@@ -126,6 +139,7 @@ def run_daily_market_data_refresh(
         },
         "steps": steps,
         "exchange_eod": exchange_eod_result,
+        "index_cache_warm": index_warm_result,
         "price_cache_warm": price_warm_result,
         "price_cache_status": cache_status,
         "warnings": warnings,
@@ -144,6 +158,41 @@ def load_daily_refresh_report(path: str | Path | None = None) -> dict[str, Any]:
         return json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _warm_index_history_cache(*, period: str, interval: str) -> dict[str, Any]:
+    """Warm official NSE index-close archives for every RRG/market-index row."""
+    try:
+        from stock_advisor.analysis.market_analytics import list_rrg_index_definitions
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "error": str(exc), "requested_index_count": 0}
+
+    index_names = ["Nifty 50"]
+    for definition in list_rrg_index_definitions().values():
+        name = str(definition.get("name") or "").strip()
+        if name:
+            index_names.append(name)
+
+    unique_names = list(dict.fromkeys(index_names))
+    rows: dict[str, int] = {}
+    missing: list[str] = []
+    for name in unique_names:
+        history = get_nse_index_price_history(name, period=period, interval=interval)
+        if history.empty:
+            missing.append(name)
+        else:
+            rows[name] = int(len(history))
+
+    return {
+        "status": "ok",
+        "requested_index_count": len(unique_names),
+        "available_index_count": len(rows),
+        "missing_index_count": len(missing),
+        "period": period,
+        "interval": interval,
+        "rows_by_index": rows,
+        "missing_indexes": missing[:25],
+    }
 
 
 def _capture_step(fn: Callable[[], Any]) -> dict[str, Any]:

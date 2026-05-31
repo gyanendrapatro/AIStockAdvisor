@@ -17,7 +17,7 @@ def run_sector_rotation_workflow(
     include_fundamentals: bool = True,
     selected_sector: str | None = None,
 ) -> dict[str, Any]:
-    """Run a fresh sector rotation workflow for UI buttons and MCP callers."""
+    """Run a sector rotation workflow from the latest available market data."""
     started_at = datetime.now(timezone.utc).isoformat()
     requested_period = period
     auto_period = auto_period or str(period).strip().lower() == "auto"
@@ -45,8 +45,8 @@ def run_sector_rotation_workflow(
 
     return {
         "workflow": "sector_rotation_workflow",
-        "mode": "fresh_realtime_run",
-        "cache_used": False,
+        "mode": "latest_available_market_data",
+        "cache_used": True,
         "started_at": started_at,
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "inputs": {
@@ -67,7 +67,7 @@ def run_sector_rotation_workflow(
             "rank_sector_stocks",
         ],
         "steps": [
-            "Fetched latest available benchmark and sector index/ETF price history.",
+            "Loaded latest available benchmark and sector index/ETF price history from cache/provider fallback.",
             *(
                 [
                     "Auto period selected: used a balanced 1y history while comparing 5D, 20D, 60D, and 120D movement windows."
@@ -83,7 +83,7 @@ def run_sector_rotation_workflow(
             "analysis_period": analysis_period,
             "primary_signals": ["20D RS vs Nifty", "60D RS vs Nifty", "trend score", "acceleration score", "breadth score"],
             "short_term_confirmation": "5D return and 20D acceleration show whether buying interest is increasing now.",
-            "summary": "Sector status is not cached. Each run fetches fresh provider data and classifies sectors from movement, relative strength, trend, acceleration, and breadth.",
+            "summary": "Sector status is recalculated on each run from latest available local/provider data and classified from movement, relative strength, trend, acceleration, and breadth.",
         },
         "indicator_explanations": indicator_explanations(),
         "decision_summary": decision_summary,

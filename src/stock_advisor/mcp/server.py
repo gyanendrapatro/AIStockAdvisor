@@ -33,6 +33,7 @@ from stock_advisor.analysis.sector_rotation import (
     rank_sector_stocks as _rank_sector_stocks,
 )
 from stock_advisor.agents.sector_rotation_workflow import run_sector_rotation_workflow as _run_sector_rotation_workflow
+from stock_advisor.agents.stock_research_agent import run_stock_research_agent as _run_stock_research_agent
 from stock_advisor.config.settings import PROJECT_ROOT, load_watchlists, settings
 from stock_advisor.data.analyst_events import (
     get_analyst_insights as _get_analyst_insights,
@@ -93,6 +94,7 @@ def server_info() -> dict[str, Any]:
             "get_watchlist",
             "analyze_stock",
             "research_stock",
+            "run_stock_research_agent",
             "rank_watchlist",
             "compare_stocks",
             "get_stock_profile",
@@ -221,6 +223,38 @@ def research_stock(
         interval=interval,
         intelligence_days=intelligence_days,
         intelligence_strategic_days=intelligence_strategic_days,
+        force_refresh_prices=force_refresh_prices,
+    )
+
+
+@mcp.tool("run_stock_research_agent")
+def run_stock_research_agent(
+    ticker: str,
+    period: str = "1y",
+    interval: str = "1d",
+    intelligence_days: int = 45,
+    intelligence_strategic_days: int = 365,
+    include_exchange_announcements: bool = True,
+    parse_exchange_pdfs: bool = True,
+    include_llm: bool = True,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    llm_base_url: str | None = None,
+    force_refresh_prices: bool = True,
+) -> dict[str, Any]:
+    """Run the LangGraph stock research agent with filings/news/PDF evidence and LLM synthesis."""
+    return _run_stock_research_agent(
+        ticker,
+        period=period,
+        interval=interval,
+        intelligence_days=intelligence_days,
+        intelligence_strategic_days=intelligence_strategic_days,
+        include_exchange_announcements=include_exchange_announcements,
+        parse_exchange_pdfs=parse_exchange_pdfs,
+        include_llm=include_llm,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_base_url=llm_base_url,
         force_refresh_prices=force_refresh_prices,
     )
 

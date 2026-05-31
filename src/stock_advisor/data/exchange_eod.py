@@ -78,6 +78,12 @@ def get_exchange_eod_rows_for_date(tickers: list[str] | tuple[str, ...], trade_d
     return out
 
 
+def clear_exchange_eod_fetch_cache() -> None:
+    """Clear in-memory NSE/BSE bhavcopy fetch caches before a forced refresh."""
+    _fetch_nse_bhavcopy.cache_clear()
+    _fetch_bse_bhavcopy.cache_clear()
+
+
 def _candidate_trade_dates(*, lookback_days: int | None = None) -> list[date]:
     days = max(1, int(lookback_days or EXCHANGE_EOD_LOOKBACK_DAYS))
     now = datetime.now(MARKET_TIMEZONE)

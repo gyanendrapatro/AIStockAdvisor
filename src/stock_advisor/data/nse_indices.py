@@ -79,6 +79,11 @@ def resolve_nse_index_name(index_name: str) -> str:
     return NSE_INDEX_NAME_ALIASES.get(name, name)
 
 
+def clear_nse_index_archive_cache() -> None:
+    """Clear in-memory NSE index archive fetch caches before a forced refresh."""
+    _fetch_daily_index_archive.cache_clear()
+
+
 def _candidate_dates(period: str) -> list[date]:
     period_days = _period_days(period) or 365
     now = datetime.now(MARKET_TIMEZONE)

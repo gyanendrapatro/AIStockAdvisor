@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from html import escape
 import sys
 import threading
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
@@ -14,9 +15,11 @@ import streamlit as st
 
 from stock_advisor.analysis.indicators import add_indicators
 from stock_advisor.analysis.market_analytics import (
+    SECTOR_ANALYTICS_VERSION,
     get_industry_analytics,
     get_market_breadth,
     get_market_indices,
+    get_moving_average_crossover_scan,
     get_relative_rotation_graph,
     get_sector_analytics,
     get_top_gainers,
@@ -27,6 +30,7 @@ from stock_advisor.analysis.market_analytics import (
 from stock_advisor.analysis.pipeline import analyze_stock, rank_watchlist
 from stock_advisor.analysis.sector_rotation import list_sector_definitions, rank_sector_stocks
 from stock_advisor.agents.sector_rotation_workflow import run_sector_rotation_workflow
+from stock_advisor.agents.stock_research_agent import run_stock_research_agent
 from stock_advisor.config.settings import load_watchlists
 from stock_advisor.data.daily_refresh import load_daily_refresh_report, run_daily_market_data_refresh
 from stock_advisor.data.market_data import get_price_cache_status, get_price_history, warm_price_history_cache
@@ -36,6 +40,11 @@ from stock_advisor.data.universe import list_sector_constituents, list_stock_uni
 SECTOR_ANALYTICS_PERIOD = "2y"
 SECTOR_ANALYTICS_INTERVAL = "1d"
 SECTOR_ANALYTICS_STOCK_LIMIT = 30
+MARKET_TIMEZONE_NAME = "Asia/Kolkata"
+MARKET_TIMEZONE = ZoneInfo(MARKET_TIMEZONE_NAME)
+AUTO_REFRESH_MIN_COVERAGE_PCT = 95.0
+AUTO_REFRESH_MIN_USABLE_COVERAGE_PCT = 80.0
+AUTO_REFRESH_RETRY_COOLDOWN_MINUTES = 15
 
 
 st.set_page_config(page_title="AI Stock Advisor", layout="wide")
@@ -177,7 +186,289 @@ def _latest_price_refresh_job(scope: str) -> dict[str, object] | None:
     return sorted(jobs, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
 
 
-stock_tab, sector_tab, universe_tab, sector_analytics_tab, rrg_tab, industry_tab, indices_tab, breadth_tab, gainers_tab = st.tabs(
+@st.cache_resource
+def _auto_market_refresh_jobs() -> dict[str, dict[str, object]]:
+    return {}
+
+
+def _auto_market_refresh_scope(warm_universe: str, expected_date: object) -> str:
+    return f"{warm_universe}:{expected_date}"
+
+
+def _latest_auto_market_refresh_job(scope: str) -> dict[str, object] | None:
+    jobs = [job for job in _auto_market_refresh_jobs().values() if job.get("scope") == scope]
+    if not jobs:
+        return None
+    return sorted(jobs, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
+
+
+def _start_auto_market_refresh_job(
+    *,
+    scope: str,
+    warm_universe: str,
+    period: str,
+    interval: str,
+    include_bse: bool,
+) -> dict[str, object]:
+    jobs = _auto_market_refresh_jobs()
+    for job in jobs.values():
+        if job.get("scope") == scope and job.get("status") == "running":
+            return job
+
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    refresh_india = warm_universe == "all_india"
+    job: dict[str, object] = {
+        "id": job_id,
+        "scope": scope,
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "warm_universe": warm_universe,
+        "period": period,
+        "interval": interval,
+        "include_bse": include_bse,
+    }
+    jobs[job_id] = job
+
+    def _runner() -> None:
+        try:
+            result = run_daily_market_data_refresh(
+                refresh_universes=False,
+                refresh_broad_universe=False,
+                refresh_full_nse_universe=False,
+                refresh_bse_universe=include_bse,
+                refresh_india_universe=refresh_india,
+                warm_price_cache=False,
+                refresh_exchange_eod=True,
+                warm_index_cache=False,
+                warm_universe=warm_universe,
+                period=period,
+                interval=interval,
+                max_universe_symbols=None,
+                max_price_symbols=None,
+                chunk_size=80,
+                retry_attempts=0,
+                force_refresh_prices=False,
+            )
+            job["status"] = "completed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["result"] = result
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = "failed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["error"] = str(exc)
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return job
+
+
+def _daily_refresh_universe(universe: str | None) -> str:
+    normalized = str(universe or "").strip().lower()
+    if normalized in {"all_india", "india", "nse_bse", "bse_nse"}:
+        return "all_india"
+    return "full_nse"
+
+
+def _expected_latest_complete_eod_date() -> str:
+    now = datetime.now(MARKET_TIMEZONE)
+    expected = now.date()
+    if now.time() < time(17, 30):
+        expected -= timedelta(days=1)
+    while expected.weekday() >= 5:
+        expected -= timedelta(days=1)
+    return expected.isoformat()
+
+
+def _universe_tickers_for_refresh_check(warm_universe: str) -> list[str]:
+    try:
+        universe_summary = list_stock_universe(universe=warm_universe, limit=None)
+    except Exception:  # noqa: BLE001
+        return []
+    return [
+        str(row.get("ticker") or "").strip().upper()
+        for row in universe_summary.get("stocks", [])
+        if str(row.get("ticker") or "").strip()
+    ]
+
+
+def _latest_cache_ready_for_universe(warm_universe: str) -> tuple[bool, dict[str, object]]:
+    tickers = _universe_tickers_for_refresh_check(warm_universe)
+    if not tickers:
+        return False, {"reason": "No tickers were available for cache freshness check."}
+
+    cache_status = get_price_cache_status(tickers=tickers, interval="1d")
+    expected_date = _expected_latest_complete_eod_date()
+    requested_count = int(cache_status.get("requested_ticker_count") or len(tickers))
+    distribution = cache_status.get("latest_price_date_distribution") or {}
+    expected_date_count = int(distribution.get(expected_date) or 0)
+    latest_date = str(cache_status.get("latest_price_date") or "")
+    latest_date_count = int(cache_status.get("latest_price_date_count") or 0)
+    latest_available_coverage_pct = round(100 * latest_date_count / requested_count, 2) if requested_count else 0.0
+    best_available_date = latest_date if latest_date >= expected_date else expected_date
+    best_available_count = latest_date_count if latest_date >= expected_date else expected_date_count
+    coverage_pct = round(100 * best_available_count / requested_count, 2) if requested_count else 0.0
+
+    ready = bool(cache_status.get("enabled")) and not cache_status.get("error") and coverage_pct >= AUTO_REFRESH_MIN_COVERAGE_PCT
+    reason = (
+        f"{coverage_pct}% of {requested_count} tickers have latest EOD {best_available_date}."
+        if ready
+        else f"Only {coverage_pct}% of {requested_count} tickers have latest EOD {best_available_date}."
+    )
+    if cache_status.get("error"):
+        reason = str(cache_status.get("error"))
+    if not cache_status.get("enabled"):
+        reason = "SQLite price cache is disabled."
+    return ready, {
+        "reason": reason,
+        "warm_universe": warm_universe,
+        "expected_latest_eod_date": expected_date,
+        "latest_price_date": latest_date or None,
+        "latest_price_date_count": latest_date_count,
+        "latest_available_coverage_pct": latest_available_coverage_pct,
+        "expected_date_count": expected_date_count,
+        "requested_ticker_count": requested_count,
+        "coverage_pct": coverage_pct,
+        "min_coverage_pct": AUTO_REFRESH_MIN_COVERAGE_PCT,
+        "cache_status": cache_status,
+    }
+
+
+def _auto_refresh_cache_key(warm_universe: str, expected_date: object) -> str:
+    return f"{warm_universe}:{expected_date}"
+
+
+def _recent_auto_refresh_report(warm_universe: str, expected_date: object) -> dict[str, object] | None:
+    attempts = st.session_state.get("auto_market_refresh_attempts") or {}
+    report = attempts.get(_auto_refresh_cache_key(warm_universe, expected_date))
+    if not isinstance(report, dict):
+        return None
+    attempted_at = report.get("attempted_at")
+    try:
+        attempted = datetime.fromisoformat(str(attempted_at))
+    except (TypeError, ValueError):
+        return None
+    if attempted.tzinfo is None:
+        attempted = attempted.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - attempted.astimezone(timezone.utc)
+    if age <= timedelta(minutes=AUTO_REFRESH_RETRY_COOLDOWN_MINUTES):
+        return report
+    return None
+
+
+def _remember_auto_refresh_report(warm_universe: str, expected_date: object, report: dict[str, object]) -> None:
+    attempts = dict(st.session_state.get("auto_market_refresh_attempts") or {})
+    report = dict(report)
+    report["attempted_at"] = datetime.now(timezone.utc).isoformat()
+    attempts[_auto_refresh_cache_key(warm_universe, expected_date)] = report
+    st.session_state["auto_market_refresh_attempts"] = attempts
+
+
+def _usable_cached_data_report(cache_readiness: dict[str, object]) -> dict[str, object] | None:
+    cache_status = cache_readiness.get("cache_status") or {}
+    if not isinstance(cache_status, dict):
+        return None
+    coverage = _number(cache_readiness.get("latest_available_coverage_pct"))
+    if coverage is None:
+        coverage = _number(cache_readiness.get("coverage_pct"))
+    if coverage is None:
+        coverage = _number(cache_status.get("fresh_coverage_pct"))
+    latest_date = cache_readiness.get("latest_price_date") or cache_status.get("latest_price_date")
+    if coverage is None or coverage < AUTO_REFRESH_MIN_USABLE_COVERAGE_PCT or not latest_date:
+        return None
+    return {
+        "status": "skipped_using_cache",
+        "reason": "Using cached market data; automatic full refresh is not repeated on every run.",
+        **cache_readiness,
+    }
+
+
+def _ensure_latest_data_before_run(
+    label: str,
+    *,
+    universe: str = "full_nse",
+    period: str = "2y",
+    interval: str = "1d",
+    include_bse: bool | None = None,
+) -> dict[str, object]:
+    warm_universe = _daily_refresh_universe(universe)
+    cache_ready, cache_readiness = _latest_cache_ready_for_universe(warm_universe)
+    expected_date = cache_readiness.get("expected_latest_eod_date") or _expected_latest_complete_eod_date()
+    refresh_india = warm_universe == "all_india"
+    refresh_bse = refresh_india if include_bse is None else bool(include_bse)
+    refresh_scope = _auto_market_refresh_scope(warm_universe, expected_date)
+    if cache_ready:
+        report = {
+            "status": "skipped",
+            "reason": "Local cache already has the latest expected complete EOD data.",
+            **cache_readiness,
+        }
+        st.session_state["latest_auto_market_refresh_report"] = report
+        st.caption(
+            "Skipped market refresh: "
+            f"{cache_readiness.get('coverage_pct')}% of {warm_universe} already has latest EOD "
+            f"{cache_readiness.get('latest_price_date') or cache_readiness.get('expected_latest_eod_date')}."
+        )
+        return report
+
+    recent_report = _recent_auto_refresh_report(warm_universe, expected_date)
+    if recent_report:
+        active_job = _latest_auto_market_refresh_job(refresh_scope)
+        report = {
+            "status": "skipped_recent_attempt",
+            "reason": "Skipped automatic refresh because this universe was already checked recently.",
+            **cache_readiness,
+            "last_attempt": recent_report,
+            "active_job": active_job,
+        }
+        st.session_state["latest_auto_market_refresh_report"] = report
+        usable = _usable_cached_data_report(cache_readiness)
+        if usable:
+            st.caption(
+                "Using cached market data through "
+                f"{cache_readiness.get('latest_price_date')} while refresh is on cooldown. "
+                "Use the explicit Refresh price data button if you want to force it."
+            )
+        else:
+            st.warning(
+                "Market data is not fully current, and automatic refresh was already attempted recently. "
+                "Continuing with available cached data."
+            )
+        return report
+
+    job = _start_auto_market_refresh_job(
+        scope=refresh_scope,
+        warm_universe=warm_universe,
+        period=period,
+        interval=interval,
+        include_bse=refresh_bse,
+    )
+    report = {
+        "status": "background_refresh_started" if job.get("status") == "running" else str(job.get("status") or "unknown"),
+        "reason": "Latest EOD data was not complete, so a background exchange-data refresh was started.",
+        **cache_readiness,
+        "refresh_job": job,
+    }
+    _remember_auto_refresh_report(warm_universe, expected_date, report)
+    usable = _usable_cached_data_report(cache_readiness)
+    if usable:
+        report = {
+            **usable,
+            "status": "background_refresh_started",
+            "refresh_job": job,
+        }
+        st.caption(
+            "Started a background latest-data check; this run is using cached data through "
+            f"{cache_readiness.get('latest_price_date')}."
+        )
+    else:
+        st.warning(
+            "Latest market data is missing, so a background refresh was started. "
+            "This calculation will continue with whatever cache is currently available."
+        )
+    st.session_state["latest_auto_market_refresh_report"] = report
+    return report
+
+
+stock_tab, sector_tab, universe_tab, sector_analytics_tab, rrg_tab, industry_tab, indices_tab, breadth_tab, crossover_tab, gainers_tab = st.tabs(
     [
         "Stock Scan",
         "Sector Rotation",
@@ -187,6 +478,7 @@ stock_tab, sector_tab, universe_tab, sector_analytics_tab, rrg_tab, industry_tab
         "Industry Analytics",
         "Market Indices",
         "Market Breadth",
+        "MA Crossovers",
         "Top Gainers",
     ]
 )
@@ -262,33 +554,220 @@ def _sector_card_panel(title: str, note: str, rows_html: str, *, scroll: bool = 
     )
 
 
-def _render_sector_industry_cards(industries: list[dict]) -> None:
+def _safe_streamlit_key(value: object) -> str:
+    text = str(value or "").strip().lower()
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in text)
+    return "_".join(part for part in cleaned.split("_") if part) or "item"
+
+
+def _average_numeric(rows: list[dict], field: str) -> float | None:
+    values = [_number(row.get(field)) for row in rows]
+    clean = [value for value in values if value is not None]
+    if not clean:
+        return None
+    return sum(clean) / len(clean)
+
+
+def _market_cap_cr(value: object) -> float | None:
+    number = _number(value)
+    if number is None:
+        return None
+    if abs(number) > 10_000_000:
+        return number / 10_000_000
+    return number
+
+
+def _industry_stock_rows(constituent_stocks: list[dict], industry: str) -> list[dict]:
+    industry_key = str(industry or "").strip().casefold()
+    rows = [
+        row
+        for row in constituent_stocks
+        if str(row.get("industry") or row.get("basic_industry") or "").strip().casefold() == industry_key
+    ]
+    return sorted(
+        rows,
+        key=lambda row: (
+            bool(row.get("passes_filter")),
+            _number(row.get("rs_rating")) or 0,
+            _number(row.get("return_20d_pct")) or -999,
+        ),
+        reverse=True,
+    )
+
+
+def _industry_stock_frame(rows: list[dict]) -> pd.DataFrame:
+    data = []
+    for row in rows:
+        market_cap = _market_cap_cr(row.get("market_cap"))
+        data.append(
+            {
+                "Stock Name": _display_ticker(row.get("ticker")),
+                "Company": row.get("name"),
+                "RS Rating": row.get("rs_rating"),
+                "Market Cap (Cr)": None if market_cap is None else round(market_cap, 2),
+                "1 Day Return (%)": row.get("return_1d_pct"),
+                "1 Week Return (%)": row.get("return_5d_pct"),
+                "1 Month Returns (%)": row.get("return_20d_pct"),
+                "3 Month Returns (%)": row.get("return_60d_pct"),
+                "% from 52W High": row.get("distance_from_52w_high_pct"),
+                "Passes Filter": row.get("passes_filter"),
+                "Latest Date": row.get("latest_date"),
+            }
+        )
+    return pd.DataFrame(data)
+
+
+def _render_sector_industry_overview(
+    industry_row: dict,
+    industry_stocks: list[dict],
+    *,
+    selected_sector_row: dict,
+    metric_label: str,
+) -> None:
+    industry_name = str(industry_row.get("industry") or "Industry")
+    sector_name = str(industry_row.get("sector") or selected_sector_row.get("name") or "Sector")
+    key_prefix = _safe_streamlit_key(f"industry_detail_{sector_name}_{industry_name}")
+
+    st.divider()
+    title_col, action_col = st.columns([4, 1])
+    title_col.subheader(f"{industry_name} Overview")
+    if action_col.button("Close overview", key=f"{key_prefix}_close", use_container_width=True):
+        st.session_state.pop("sector_analytics_industry_detail", None)
+        st.rerun()
+
+    group_market_cap = sum(
+        value
+        for value in (_market_cap_cr(row.get("market_cap")) for row in industry_stocks)
+        if value is not None
+    )
+    passing_count = int(_number(industry_row.get("passing_count")) or 0)
+    eligible_count = int(_number(industry_row.get("eligible_count")) or 0)
+    stock_count = int(_number(industry_row.get("stock_count")) or len(industry_stocks))
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Industry", industry_name)
+    c2.metric("Number of Stocks", stock_count)
+    c3.metric("Group Market Cap", f"{group_market_cap:,.0f} Cr" if group_market_cap else "n/a")
+    c4.metric("Contribution", f"{_number(industry_row.get('contribution_pct')) or 0:.1f}%")
+    c5.metric("Passing", passing_count, delta=f"of {eligible_count} eligible")
+
+    st.caption(
+        f"{metric_label}. Industry contribution = passing stocks in this industry / eligible stocks in {sector_name}."
+    )
+
+    perf_rows = [
+        {"Time Frame": "1D", "Industry Performance (%)": _average_numeric(industry_stocks, "return_1d_pct")},
+        {"Time Frame": "1W", "Industry Performance (%)": _average_numeric(industry_stocks, "return_5d_pct")},
+        {"Time Frame": "1M", "Industry Performance (%)": _average_numeric(industry_stocks, "return_20d_pct")},
+        {"Time Frame": "3M", "Industry Performance (%)": _average_numeric(industry_stocks, "return_60d_pct")},
+    ]
+    perf_rows = [row for row in perf_rows if row["Industry Performance (%)"] is not None]
+    chart_col, breadth_col = st.columns([1.5, 1])
+    with chart_col:
+        if perf_rows:
+            perf_df = pd.DataFrame(perf_rows)
+            perf_fig = go.Figure()
+            perf_fig.add_trace(
+                go.Bar(
+                    x=perf_df["Time Frame"],
+                    y=perf_df["Industry Performance (%)"],
+                    marker_color=[
+                        "#16a34a" if (_number(value) or 0) >= 0 else "#dc2626"
+                        for value in perf_df["Industry Performance (%)"]
+                    ],
+                    text=perf_df["Industry Performance (%)"].map(lambda value: f"{value:.1f}%"),
+                    textposition="auto",
+                )
+            )
+            perf_fig.update_layout(
+                title="Industry Performance",
+                yaxis_title="Return (%)",
+                height=360,
+                margin=dict(l=10, r=10, t=45, b=10),
+            )
+            st.plotly_chart(perf_fig, width="stretch")
+        else:
+            st.info("No return window data was available for this industry.")
+    with breadth_col:
+        if eligible_count:
+            breadth_fig = go.Figure(
+                go.Pie(
+                    labels=["Passing", "Not passing"],
+                    values=[passing_count, max(eligible_count - passing_count, 0)],
+                    hole=0.58,
+                    marker_colors=["#10b981", "#64748b"],
+                    textinfo="percent+label",
+                )
+            )
+            breadth_fig.update_layout(
+                title="Filter Breadth",
+                height=360,
+                margin=dict(l=10, r=10, t=45, b=10),
+                showlegend=False,
+            )
+            st.plotly_chart(breadth_fig, width="stretch")
+        else:
+            st.info("No eligible stocks for the active filter.")
+
+    stock_frame = _industry_stock_frame(industry_stocks)
+    if stock_frame.empty:
+        st.info("No stock rows were available for this industry.")
+        return
+
+    st.markdown("**Industry Stocks**")
+    st.dataframe(stock_frame, width="stretch", hide_index=True)
+
+    rs_fig = go.Figure()
+    rs_fig.add_trace(
+        go.Bar(
+            x=stock_frame.head(25)["RS Rating"],
+            y=stock_frame.head(25)["Stock Name"],
+            orientation="h",
+            marker_color="#10b981",
+            text=stock_frame.head(25)["RS Rating"].map(lambda value: "n/a" if pd.isna(value) else f"{value:.0f}"),
+            textposition="auto",
+        )
+    )
+    rs_fig.update_layout(
+        title=f"Top RS Stocks in {industry_name}",
+        xaxis_title="RS Rating",
+        yaxis=dict(autorange="reversed"),
+        height=max(340, min(760, 30 * len(stock_frame.head(25)) + 90)),
+        margin=dict(l=10, r=10, t=45, b=10),
+    )
+    st.plotly_chart(rs_fig, width="stretch")
+
+
+def _render_sector_industry_cards(industries: list[dict], *, key_prefix: str) -> dict | None:
     if not industries:
         _sector_card_panel(
             "STRONG Industries",
             "% indicates the contribution of industry towards sector's performance",
             '<div class="sector-side-note">No industry contribution data for this sector.</div>',
         )
-        return
-    rows = []
-    for row in industries[:8]:
-        industry = escape(str(row.get("industry") or "n/a"))
-        sector = escape(str(row.get("sector") or "n/a"))
+        return None
+
+    st.markdown("**STRONG Industries**")
+    st.caption("% indicates the contribution of industry towards sector's performance")
+    clicked: dict | None = None
+    active_state = st.session_state.get("sector_analytics_industry_detail") or {}
+    active_industry = str(active_state.get("industry") or "")
+    for idx, row in enumerate(industries[:8]):
+        industry = str(row.get("industry") or "n/a")
+        sector = str(row.get("sector") or "n/a")
         contribution = _number(row.get("contribution_pct")) or 0.0
-        rows.append(
-            '<div class="sector-side-row">'
-            '<div class="sector-side-main">'
-            f'<span class="sector-side-name">{industry}</span>'
-            f'<span class="sector-side-pill">{sector}</span>'
-            "</div>"
-            f'<div class="sector-side-value">{contribution:.1f}%</div>'
-            "</div>"
-        )
-    _sector_card_panel(
-        "STRONG Industries",
-        "% indicates the contribution of industry towards sector's performance",
-        "".join(rows),
-    )
+        button_label = f"{industry} · {sector}"
+        if industry == active_industry:
+            button_label = f"Selected: {button_label}"
+        c1, c2 = st.columns([3.2, 0.8])
+        if c1.button(
+            button_label,
+            key=f"{key_prefix}_industry_{idx}_{_safe_streamlit_key(industry)}",
+            use_container_width=True,
+        ):
+            clicked = row
+        c2.metric(" ", f"{contribution:.1f}%")
+    return clicked
 
 
 def _render_sector_stock_cards(stocks: list[dict]) -> None:
@@ -317,6 +796,89 @@ def _render_sector_stock_cards(stocks: list[dict]) -> None:
             "</div>"
         )
     _sector_card_panel("STRONG Stocks", "Number after stock name indicates RS", "".join(rows), scroll=True)
+
+
+def _render_sector_stock_action_buttons(stocks: list[dict], *, key_prefix: str) -> str | None:
+    if not stocks:
+        return None
+    st.caption("Click a stock to run the full research agent.")
+    clicked: str | None = None
+    for idx, row in enumerate(stocks[:12]):
+        ticker = str(row.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        display = _display_ticker(ticker)
+        industry = str(row.get("industry") or "n/a")
+        rs_rating = _number(row.get("rs_rating"))
+        rs_text = "n/a" if rs_rating is None else f"{rs_rating:.0f}"
+        c1, c2, c3 = st.columns([0.9, 1.8, 0.45])
+        if c1.button(display, key=f"{key_prefix}_research_{idx}_{ticker}", use_container_width=True):
+            clicked = ticker
+        c2.caption(industry)
+        c3.metric("RS", rs_text)
+    return clicked
+
+
+def _render_stock_research_agent_result(result: dict) -> None:
+    verdict = result.get("verdict") or {}
+    analysis = result.get("analysis") or {}
+    llm = result.get("llm") or {}
+    workflow = result.get("workflow") or {}
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Agent verdict", verdict.get("action") or "n/a")
+    c2.metric("Score", verdict.get("score") or analysis.get("final_score"))
+    c3.metric("Risk", verdict.get("risk_score") or analysis.get("risk_score"))
+    c4.metric("Confidence", f"{verdict.get('confidence', analysis.get('confidence', 0))}%")
+    c5.metric("Workflow", workflow.get("backend") or "n/a")
+    c6.metric("LLM", "Used" if llm.get("used") else "Missing/off")
+
+    st.markdown("**Research Summary**")
+    st.write(result.get("executive_summary") or result.get("deterministic_summary") or "No summary generated.")
+
+    warnings = result.get("warnings") or []
+    if warnings:
+        with st.expander("Data gaps and warnings", expanded=False):
+            st.write(warnings)
+
+    t1, t2, t3, t4, t5, t6 = st.tabs(["Technicals", "Fundamentals", "News", "Exchange filings", "Intelligence", "Raw"])
+    with t1:
+        st.json(analysis.get("latest_indicators", {}))
+        st.json(analysis.get("chart_patterns", {}))
+    with t2:
+        st.json(analysis.get("fundamentals", {}))
+        st.json((analysis.get("analyst_insights") or {}).get("consensus", {}))
+        st.json(analysis.get("stock_events", {}))
+    with t3:
+        news_rows = analysis.get("news") or []
+        st.dataframe(pd.DataFrame(news_rows), width="stretch") if news_rows else st.info("No recent news rows returned.")
+    with t4:
+        exchange = result.get("exchange_announcements") or {}
+        rows = exchange.get("announcements") or []
+        if rows:
+            display_rows = [
+                {
+                    "exchange": row.get("exchange"),
+                    "published_at": row.get("published_at"),
+                    "headline": row.get("headline"),
+                    "categories": ", ".join(row.get("material_categories") or []),
+                    "attachment_url": row.get("attachment_url"),
+                    "has_pdf_text": bool(row.get("attachment_text_excerpt")),
+                }
+                for row in rows
+            ]
+            st.dataframe(pd.DataFrame(display_rows), width="stretch")
+            parsed_rows = [row for row in rows if row.get("attachment_text_excerpt")]
+            for row in parsed_rows[:2]:
+                with st.expander(str(row.get("headline") or "Parsed PDF excerpt"), expanded=False):
+                    st.write(row.get("attachment_text_excerpt"))
+        else:
+            st.info("No NSE/BSE announcement rows returned for this stock.")
+    with t5:
+        st.json(analysis.get("company_intelligence", {}))
+        st.write("Watch items")
+        st.write(result.get("watch_items", []))
+    with t6:
+        st.json(result)
 
 
 def _top_gainer_industry_from_plotly_state(state: object, industries: list[dict]) -> str | None:
@@ -368,6 +930,55 @@ def _top_gainer_industry_frame(rows: list[dict]) -> pd.DataFrame:
                 "Gainers": row.get("passing_count"),
                 "Eligible": row.get("eligible_count"),
                 "Formula": row.get("formula"),
+                "Top Stock": _display_ticker(row.get("top_stock")),
+            }
+            for row in rows
+        ]
+    )
+
+
+def _ma_crossover_stock_frame(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(
+        [
+            {
+                "Stock": _display_ticker(row.get("ticker")),
+                "Signal": row.get("signal"),
+                "Cross Date": row.get("cross_date"),
+                "Days Since Cross": row.get("periods_since_cross"),
+                "Sector": row.get("sector"),
+                "Industry": row.get("industry"),
+                "RS": row.get("rs_rating"),
+                "Close": row.get("close"),
+                "50 DMA": row.get("sma_50"),
+                "200 DMA": row.get("sma_200"),
+                "DMA Gap (%)": row.get("sma_gap_pct"),
+                "Return Since Cross (%)": row.get("return_since_cross_pct"),
+                "1M Return (%)": row.get("return_20d_pct"),
+                "3M Return (%)": row.get("return_60d_pct"),
+                "Market Cap (Cr)": row.get("market_cap_cr"),
+                "Latest Date": row.get("latest_date"),
+            }
+            for row in rows
+        ]
+    )
+
+
+def _ma_crossover_summary_frame(rows: list[dict], group_key: str) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    title = "Sector" if group_key == "sector" else "Industry"
+    return pd.DataFrame(
+        [
+            {
+                title: row.get(group_key),
+                "Signals": row.get("signal_count"),
+                "Bullish": row.get("bullish_count"),
+                "Bearish": row.get("bearish_count"),
+                "Avg RS": row.get("avg_rs_rating"),
+                "Avg Return Since Cross (%)": row.get("avg_return_since_cross_pct"),
+                "Latest Cross Date": row.get("latest_cross_date"),
                 "Top Stock": _display_ticker(row.get("top_stock")),
             }
             for row in rows
@@ -660,13 +1271,14 @@ with stock_tab:
     period = c2.selectbox("Period", ["3mo", "6mo", "1y", "2y"], index=1)
     interval = c3.selectbox("Interval", ["1d", "1wk"], index=0)
     include_news = c4.checkbox("Include news sentiment", value=True)
-    force_refresh_prices = c5.checkbox("Refresh NSE/BSE price", value=True)
+    force_refresh_prices = c5.checkbox("Force price refetch", value=False)
     c1, c2, c3 = st.columns([1, 2.2, 1])
     run = c1.button("Run scan")
     custom_ticker = c2.text_input("Analyze ticker", placeholder="AAPL or RELIANCE.NS")
     analyze_one = c3.button("Analyze ticker")
 
     if run or analyze_one:
+        _ensure_latest_data_before_run("stock scan", period=period, interval=interval)
         with st.spinner("Scanning..."):
             if analyze_one and custom_ticker.strip():
                 rows = [
@@ -814,8 +1426,8 @@ with sector_tab:
         value=6,
         help="Number of stock candidates ranked inside the selected or top sector.",
     )
-    run_sector = c3.button("Run sector rotation", help="Fetch fresh data and rerun the full sector workflow.")
-    st.caption("Auto period still runs a fresh analysis. The table arrows show whether each movement or RS value is rising, falling, or flat.")
+    run_sector = c3.button("Run sector rotation", help="Use latest cached data; start a background exchange refresh only if latest EOD is missing.")
+    st.caption("Auto period recalculates from the latest available local data. The table arrows show whether each movement or RS value is rising, falling, or flat.")
 
     sector_definitions = list_sector_definitions()
     sector_options = {f"{row['name']} ({sector_id})": sector_id for sector_id, row in sector_definitions.items()}
@@ -824,7 +1436,8 @@ with sector_tab:
     run_selected_sector = st.button("Run selected sector")
 
     if run_sector or run_selected_sector:
-        with st.spinner("Running fresh sector workflow..."):
+        _ensure_latest_data_before_run("sector rotation", period=sector_analysis_period, interval=sector_interval)
+        with st.spinner("Running sector workflow..."):
             st.session_state["sector_rotation_workflow_result"] = run_sector_rotation_workflow(
                 period=sector_period,
                 interval=sector_interval,
@@ -849,8 +1462,8 @@ with sector_tab:
             else inputs.get("analysis_period")
         )
         st.caption(
-            f"Last fresh workflow run completed at {workflow_result.get('completed_at')} | "
-            f"period: {period_label} | interval: {inputs.get('interval')} | fresh provider run"
+            f"Last workflow run completed at {workflow_result.get('completed_at')} | "
+            f"period: {period_label} | interval: {inputs.get('interval')} | latest available local data"
         )
 
         with st.expander("Indicator, Filter, and Column Guide", expanded=False):
@@ -1348,6 +1961,25 @@ with sector_analytics_tab:
         sector_analytics_rs = 80
         sector_analytics_near_high = c1.slider("% from 52w High <", min_value=1.0, max_value=20.0, value=5.0, step=0.5, key="sector_analytics_near_high")
 
+    with st.expander("Stock Research Agent Settings", expanded=False):
+        st.caption(
+            "The UI calls the internal research agent directly. MCP exposes the same shared agent for external tools, but the dashboard does not require an MCP server."
+        )
+        a1, a2, a3, a4 = st.columns(4)
+        stock_agent_llm_mode = a1.selectbox(
+            "LLM synthesis",
+            ["Off", "Auto from .env", "OpenAI-compatible", "Ollama/local"],
+            index=1,
+            key="sector_stock_agent_llm_mode",
+        )
+        stock_agent_llm_model = a2.text_input("LLM model override", value="", key="sector_stock_agent_llm_model")
+        stock_agent_llm_base_url = a3.text_input("LLM base URL override", value="", key="sector_stock_agent_llm_base_url")
+        stock_agent_parse_pdfs = a4.checkbox("Parse result PDFs", value=True, key="sector_stock_agent_parse_pdfs")
+        st.caption(
+            "Cloud mode uses STOCK_ADVISOR_LLM_PROVIDER=openai_compatible plus STOCK_ADVISOR_LLM_API_KEY or OPENAI_API_KEY. "
+            "Local mode uses STOCK_ADVISOR_LLM_PROVIDER=ollama and a local Ollama-compatible server."
+        )
+
     sector_analytics_options = {"Auto: top sector from this run": None}
     sector_universe_tickers: list[str] = []
     if sector_analytics_universe in {"broad", "full_nse", "all_india"}:
@@ -1427,7 +2059,14 @@ with sector_analytics_tab:
                 c2.error(f"Last price refresh failed: {refresh_job.get('error')}")
 
     if run_sector_analytics:
-        with st.spinner("Running fresh sector analytics..."):
+        _ensure_latest_data_before_run(
+            "sector analytics",
+            universe=sector_analytics_universe,
+            period=SECTOR_ANALYTICS_PERIOD,
+            interval=SECTOR_ANALYTICS_INTERVAL,
+            include_bse=sector_analytics_universe == "all_india",
+        )
+        with st.spinner("Running sector analytics..."):
             sector_analytics_result = get_sector_analytics(
                 mode=sector_mode,
                 period=SECTOR_ANALYTICS_PERIOD,
@@ -1439,13 +2078,14 @@ with sector_analytics_tab:
                 max_stocks=SECTOR_ANALYTICS_STOCK_LIMIT,
                 universe=sector_analytics_universe,
                 refresh_universe=sector_analytics_universe == "broad",
+                force_refresh_prices=False,
             )
             st.session_state["sector_analytics_result"] = sector_analytics_result
             if sector_analytics_result.get("selected_sector_id"):
                 st.session_state["sector_analytics_drilldown_sector_id"] = sector_analytics_result["selected_sector_id"]
 
     sector_analytics_result = st.session_state.get("sector_analytics_result")
-    if sector_analytics_result and sector_analytics_result.get("calculation_version") != "sector_analytics_click_drilldown_v4":
+    if sector_analytics_result and sector_analytics_result.get("calculation_version") != SECTOR_ANALYTICS_VERSION:
         st.session_state.pop("sector_analytics_result", None)
         sector_analytics_result = None
     if sector_analytics_result:
@@ -1485,6 +2125,28 @@ with sector_analytics_tab:
         with st.expander("Indicator, Filter, and Column Guide", expanded=False):
             st.write(sector_analytics_result.get("methodology"))
             st.dataframe(pd.DataFrame(sector_analytics_result.get("column_explanations", [])), width="stretch")
+
+        industry_detail_state = st.session_state.get("sector_analytics_industry_detail") or {}
+        selected_industry_name = str(industry_detail_state.get("industry") or "")
+        if industry_detail_state.get("sector_id") != selected_sector_id:
+            selected_industry_name = ""
+        if selected_industry_name:
+            selected_industry_row = next(
+                (
+                    row
+                    for row in industries
+                    if str(row.get("industry") or "").strip().casefold() == selected_industry_name.strip().casefold()
+                ),
+                None,
+            )
+            selected_industry_stocks = _industry_stock_rows(constituent_stocks, selected_industry_name)
+            if selected_industry_row:
+                _render_sector_industry_overview(
+                    selected_industry_row,
+                    selected_industry_stocks,
+                    selected_sector_row=selected_sector_row,
+                    metric_label=metric_label,
+                )
 
         if sectors:
             sector_analytics_df = pd.DataFrame(sectors)
@@ -1537,7 +2199,16 @@ with sector_analytics_tab:
                     stocks = stocks_by_sector.get(selected_sector_id, [])
                     constituent_stocks = constituent_stocks_by_sector.get(selected_sector_id, [])
             with right_col:
-                _render_sector_industry_cards(industries)
+                clicked_industry = _render_sector_industry_cards(
+                    industries,
+                    key_prefix=f"sector_{selected_sector_id or 'all'}",
+                )
+                if clicked_industry:
+                    st.session_state["sector_analytics_industry_detail"] = {
+                        "sector_id": selected_sector_id,
+                        "industry": clicked_industry.get("industry"),
+                    }
+                    st.rerun()
                 _render_sector_stock_cards(stocks)
 
             sector_display_columns = [
@@ -1560,6 +2231,55 @@ with sector_analytics_tab:
             ]
             with st.expander("Sector ranking table", expanded=False):
                 st.dataframe(sector_analytics_df[[column for column in sector_display_columns if column in sector_analytics_df.columns]], width="stretch")
+
+        if stocks:
+            with st.expander("Stock Research Agent", expanded=bool(st.session_state.get("sector_stock_agent_result"))):
+                st.caption(
+                    "This runs the LangGraph stock-research workflow: market refresh, technical/fundamental research, news, NSE/BSE filings, optional PDF parsing, and LLM synthesis."
+                )
+                clicked_stock_ticker = _render_sector_stock_action_buttons(
+                    stocks,
+                    key_prefix=f"sector_{selected_sector_id or 'all'}",
+                )
+                c1, c2 = st.columns([2.5, 1])
+                manual_stock_ticker = c1.text_input("Or enter any NSE/BSE ticker", placeholder="RELIANCE.NS", key="sector_stock_agent_manual_ticker")
+                run_stock_agent = c2.button("Run stock research agent", key="sector_stock_agent_run")
+                target_ticker = clicked_stock_ticker or manual_stock_ticker.strip()
+                if (clicked_stock_ticker or run_stock_agent) and not target_ticker:
+                    st.warning("Choose a stock button or enter a ticker.")
+                if (clicked_stock_ticker or run_stock_agent) and target_ticker:
+                    llm_provider = {
+                        "Off": "disabled",
+                        "Auto from .env": None,
+                        "OpenAI-compatible": "openai_compatible",
+                        "Ollama/local": "ollama",
+                    }[stock_agent_llm_mode]
+                    _ensure_latest_data_before_run(
+                        f"stock research for {_display_ticker(target_ticker)}",
+                        universe=sector_analytics_universe,
+                        period="2y",
+                        interval=SECTOR_ANALYTICS_INTERVAL,
+                        include_bse=sector_analytics_universe == "all_india",
+                    )
+                    with st.spinner(f"Running stock research agent for {_display_ticker(target_ticker)}..."):
+                        st.session_state["sector_stock_agent_result"] = run_stock_research_agent(
+                            target_ticker,
+                            period="1y",
+                            interval=SECTOR_ANALYTICS_INTERVAL,
+                            intelligence_days=45,
+                            intelligence_strategic_days=365,
+                            include_exchange_announcements=True,
+                            parse_exchange_pdfs=stock_agent_parse_pdfs,
+                            include_llm=stock_agent_llm_mode != "Off",
+                            llm_provider=llm_provider,
+                            llm_model=stock_agent_llm_model.strip() or None,
+                            llm_base_url=stock_agent_llm_base_url.strip() or None,
+                            force_refresh_prices=False,
+                        )
+
+                stock_agent_result = st.session_state.get("sector_stock_agent_result")
+                if stock_agent_result:
+                    _render_stock_research_agent_result(stock_agent_result)
 
         if industries:
             with st.expander(f"Industry details: {selected_sector_row.get('name') or 'selected sector'}", expanded=False):
@@ -1687,6 +2407,11 @@ with rrg_tab:
     )
 
     if run_rrg:
+        _ensure_latest_data_before_run(
+            "RRG",
+            period=rrg_period,
+            interval={"Daily": "1d", "Weekly": "1wk"}[rrg_interval_label],
+        )
         with st.spinner("Calculating fresh RRG trails..."):
             st.session_state["standalone_rrg_result"] = get_relative_rotation_graph(
                 period=rrg_period,
@@ -1695,6 +2420,7 @@ with rrg_tab:
                 trail_length=rrg_tail_length,
                 selected_sectors=[rrg_sector_options[label] for label in selected_rrg_sector_labels],
                 zone=rrg_zones,
+                force_refresh_prices=False,
             )
 
     rrg_result = st.session_state.get("standalone_rrg_result")
@@ -1770,6 +2496,11 @@ with rrg_tab:
             rrg_drill_label = c1.selectbox("Dive into Sector Index", list(rrg_drill_options), key="rrg_drill_sector")
             run_rrg_drill = c2.button("Rank stocks in RRG sector")
             if run_rrg_drill:
+                _ensure_latest_data_before_run(
+                    "RRG stock drill-down",
+                    period=rrg_period,
+                    interval={"Daily": "1d", "Weekly": "1wk"}[rrg_interval_label],
+                )
                 with st.spinner("Ranking stocks inside selected RRG sector..."):
                     st.session_state["rrg_stock_result"] = rank_sector_stocks(
                         rrg_drill_options[rrg_drill_label],
@@ -1855,7 +2586,13 @@ with industry_tab:
     run_industry_stocks = c3.button("Rank selected industry stocks")
 
     if run_industry:
-        with st.spinner("Running fresh industry analytics..."):
+        _ensure_latest_data_before_run(
+            "industry analytics",
+            universe=industry_universe,
+            period=industry_period,
+            interval=industry_interval,
+        )
+        with st.spinner("Running industry analytics..."):
             st.session_state["industry_analytics_result"] = get_industry_analytics(
                 period=industry_period,
                 interval=industry_interval,
@@ -1864,9 +2601,16 @@ with industry_tab:
                 include_fundamentals=industry_include_fundamentals,
                 universe=industry_universe,
                 refresh_universe=industry_universe == "broad",
+                force_refresh_prices=False,
             )
 
     if run_industry_stocks and selected_industry:
+        _ensure_latest_data_before_run(
+            "industry stock ranking",
+            universe=industry_universe,
+            period=industry_period,
+            interval=industry_interval,
+        )
         with st.spinner("Ranking stocks inside selected industry..."):
             st.session_state["industry_stock_result"] = rank_industry_stocks(
                 selected_industry,
@@ -1876,6 +2620,7 @@ with industry_tab:
                 include_fundamentals=True,
                 universe=industry_universe,
                 refresh_universe=industry_universe == "broad",
+                force_refresh_prices=False,
             )
 
     industry_result = st.session_state.get("industry_analytics_result")
@@ -2003,9 +2748,18 @@ with indices_tab:
     run_indices = c3.button("Run market indices")
 
     if run_indices:
+        _ensure_latest_data_before_run("market indices", period=indices_period, interval=indices_interval)
         with st.spinner("Fetching latest available index data..."):
-            st.session_state["market_indices_result"] = get_market_indices(period=indices_period, interval=indices_interval)
-            st.session_state["rrg_result"] = get_relative_rotation_graph(period=indices_period, interval=indices_interval)
+            st.session_state["market_indices_result"] = get_market_indices(
+                period=indices_period,
+                interval=indices_interval,
+                force_refresh_prices=False,
+            )
+            st.session_state["rrg_result"] = get_relative_rotation_graph(
+                period=indices_period,
+                interval=indices_interval,
+                force_refresh_prices=False,
+            )
 
     indices_result = st.session_state.get("market_indices_result")
     rrg_result = st.session_state.get("rrg_result")
@@ -2086,11 +2840,13 @@ with breadth_tab:
     run_breadth = st.button("Run market breadth")
 
     if run_breadth:
+        _ensure_latest_data_before_run("market breadth", period=breadth_period, interval=breadth_interval)
         with st.spinner("Checking market participation..."):
             st.session_state["market_breadth_result"] = get_market_breadth(
                 period=breadth_period,
                 interval=breadth_interval,
                 max_stocks=breadth_limit,
+                force_refresh_prices=False,
             )
 
     breadth_result = st.session_state.get("market_breadth_result")
@@ -2137,6 +2893,129 @@ with breadth_tab:
     else:
         st.info("Run market breadth to see whether market movement has broad participation.")
 
+with crossover_tab:
+    st.subheader("50 DMA / 200 DMA Crossovers")
+    st.caption("Find stocks where the 50-day simple moving average recently crossed the 200-day simple moving average.")
+    c1, c2, c3, c4 = st.columns(4)
+    crossover_universe_label = c1.selectbox(
+        "Universe",
+        ["Full NSE Equity Master", "Nifty Total Market", "Local configured baskets", "All India NSE+BSE"],
+        index=0,
+        key="ma_cross_universe",
+    )
+    crossover_universe = {
+        "Full NSE Equity Master": "full_nse",
+        "Nifty Total Market": "broad",
+        "Local configured baskets": "local",
+        "All India NSE+BSE": "all_india",
+    }[crossover_universe_label]
+    crossover_direction_label = c2.selectbox(
+        "Cross type",
+        ["Bullish golden cross", "Bearish death cross", "Both"],
+        index=0,
+        key="ma_cross_direction",
+    )
+    crossover_direction = {
+        "Bullish golden cross": "bullish",
+        "Bearish death cross": "bearish",
+        "Both": "both",
+    }[crossover_direction_label]
+    crossover_lookback = c3.slider("Cross happened within", min_value=1, max_value=120, value=20, step=1, key="ma_cross_lookback")
+    crossover_min_market_cap = c4.number_input("Market Cap >", min_value=0.0, value=0.0, step=250.0, key="ma_cross_market_cap")
+
+    s1, s2, s3, s4 = st.columns(4)
+    crossover_period = s1.selectbox("Price period", ["1y", "2y", "5y"], index=1, key="ma_cross_period")
+    crossover_interval = s2.selectbox("Price interval", ["1d"], index=0, key="ma_cross_interval")
+    crossover_max_rows = s3.slider("Rows", min_value=25, max_value=300, value=150, step=25, key="ma_cross_rows")
+    crossover_force_refresh = s4.checkbox("Force price refetch", value=False, key="ma_cross_force_refresh")
+    run_crossover_scan = st.button("Run crossover scan", key="run_ma_crossover_scan")
+
+    if run_crossover_scan:
+        _ensure_latest_data_before_run(
+            "50/200 moving-average crossover scan",
+            universe=crossover_universe,
+            period=crossover_period,
+            interval=crossover_interval,
+            include_bse=crossover_universe == "all_india",
+        )
+        with st.spinner("Scanning 50 DMA / 200 DMA crossovers..."):
+            st.session_state["ma_crossover_result"] = get_moving_average_crossover_scan(
+                period=crossover_period,
+                interval=crossover_interval,
+                universe=crossover_universe,
+                direction=crossover_direction,
+                lookback_periods=int(crossover_lookback),
+                min_market_cap_cr=float(crossover_min_market_cap),
+                max_rows=int(crossover_max_rows),
+                force_refresh_prices=bool(crossover_force_refresh),
+            )
+
+    crossover_result = st.session_state.get("ma_crossover_result")
+    if crossover_result:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Universe stocks", crossover_result.get("universe_stock_count"))
+        c2.metric("Price data", crossover_result.get("price_data_stock_count"))
+        c3.metric("Eligible 50/200 DMA", crossover_result.get("eligible_stock_count"))
+        c4.metric("Signals", crossover_result.get("signal_stock_count"))
+        c5.metric("Data through", crossover_result.get("price_history_end_date") or "n/a")
+
+        if crossover_result.get("warnings"):
+            for warning in crossover_result.get("warnings", []):
+                st.warning(warning)
+
+        st.caption(crossover_result.get("methodology"))
+        crossover_rows = crossover_result.get("stocks", [])
+        sector_summary = crossover_result.get("sector_summary", [])
+        industry_summary = crossover_result.get("industry_summary", [])
+
+        if crossover_rows:
+            stock_df = _ma_crossover_stock_frame(crossover_rows)
+            left, right = st.columns([1.4, 1])
+            with left:
+                sector_df = _ma_crossover_summary_frame(sector_summary, "sector")
+                if not sector_df.empty:
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Bar(
+                            x=sector_df["Signals"],
+                            y=sector_df["Sector"],
+                            orientation="h",
+                            marker_color="#10b981" if crossover_direction != "bearish" else "#ef4444",
+                            text=sector_df["Signals"],
+                            textposition="auto",
+                        )
+                    )
+                    fig.update_layout(
+                        title="Signals by Sector",
+                        xaxis_title="Stocks",
+                        yaxis=dict(autorange="reversed"),
+                        height=max(360, 30 * len(sector_df) + 90),
+                        margin=dict(l=10, r=10, t=45, b=30),
+                    )
+                    st.plotly_chart(fig, width="stretch")
+            with right:
+                st.markdown("**Top Sectors**")
+                sector_table = _ma_crossover_summary_frame(sector_summary[:12], "sector")
+                st.dataframe(sector_table, width="stretch", hide_index=True)
+
+            st.markdown("**Stocks Matching 50/200 DMA Cross**")
+            st.dataframe(stock_df, width="stretch", hide_index=True)
+            st.download_button(
+                "Download crossover stocks",
+                stock_df.to_csv(index=False),
+                file_name="ma_50_200_crossovers.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+
+            with st.expander("Industry summary", expanded=False):
+                industry_df = _ma_crossover_summary_frame(industry_summary, "industry")
+                st.dataframe(industry_df, width="stretch", hide_index=True)
+        else:
+            st.info("No stocks matched the selected 50/200 DMA crossover filters. Increase the lookback window or choose Both.")
+    else:
+        st.info("Run the crossover scan to list stocks with recent bullish or bearish 50 DMA / 200 DMA crosses.")
+
 with gainers_tab:
     st.subheader("Top Gainers")
     st.caption("Be the first to unpack the next sector or industry move from a single glance.")
@@ -2162,11 +3041,17 @@ with gainers_tab:
         gainers_period = s2.selectbox("Price period", ["3mo", "6mo", "1y", "2y"], index=2)
         gainers_interval = s3.selectbox("Price interval", ["1d", "1wk"], index=0)
         max_gainers = s4.slider("Overall table rows", min_value=10, max_value=150, value=60)
-        gainers_force_refresh = s5.checkbox("Refresh NSE/BSE", value=True, key="top_gainers_force_refresh")
+        gainers_force_refresh = s5.checkbox("Force price refetch", value=False, key="top_gainers_force_refresh")
 
     run_gainers = st.button("Run top gainers")
 
     if run_gainers:
+        _ensure_latest_data_before_run(
+            "top gainers",
+            universe=gainers_universe,
+            period=gainers_period,
+            interval=gainers_interval,
+        )
         with st.spinner("Ranking top gainers..."):
             st.session_state["top_gainers_result"] = get_top_gainers(
                 period=gainers_period,
