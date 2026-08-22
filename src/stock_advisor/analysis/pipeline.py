@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import math
+import os
 from typing import Any
 
 import pandas as pd
@@ -15,6 +17,11 @@ from stock_advisor.data.analyst_events import get_analyst_insights, get_stock_ev
 from stock_advisor.data.company_intelligence import get_company_intelligence
 from stock_advisor.data.market_data import get_basic_fundamentals, get_price_history
 from stock_advisor.data.news import get_news
+
+# Analyzing a ticker is I/O-bound (price/fundamentals/news are all network fetches), so a
+# multi-ticker scan or comparison fans them out across a small thread pool instead of
+# looping serially. Rate-limit-friendly default; override via env if needed.
+SCAN_MAX_WORKERS = int(os.getenv("STOCK_SCAN_MAX_WORKERS", "8"))
 
 
 def analyze_stock(
@@ -143,6 +150,37 @@ def research_stock(
     )
 
 
+def _analyze_stock_safe(ticker: str, **kwargs: Any) -> dict[str, Any]:
+    """analyze_stock, but never raises — one bad ticker shouldn't sink a batch scan."""
+    try:
+        return analyze_stock(ticker, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ticker": ticker,
+            "error": str(exc),
+            "final_score": 0,
+            "signal": "Error",
+            "confidence": 0,
+            "reasons": [],
+            "risks": ["Analysis failed before scoring."],
+            "metadata": {
+                "warnings": [str(exc)],
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+
+
+def _analyze_stocks_concurrently(tickers: list[str], **kwargs: Any) -> list[dict[str, Any]]:
+    """Fan out analyze_stock across a thread pool (I/O-bound: price/fundamentals/news fetches)."""
+    if not tickers:
+        return []
+    if len(tickers) == 1:
+        return [_analyze_stock_safe(tickers[0], **kwargs)]
+    with ThreadPoolExecutor(max_workers=min(SCAN_MAX_WORKERS, len(tickers))) as executor:
+        futures = [executor.submit(_analyze_stock_safe, ticker, **kwargs) for ticker in tickers]
+        return [future.result() for future in as_completed(futures)]
+
+
 def rank_watchlist(
     group: str | None = None,
     *,
@@ -155,37 +193,15 @@ def rank_watchlist(
 ) -> list[dict[str, Any]]:
     """Analyze and rank all tickers in a watchlist group."""
     tickers = get_watchlist_tickers(group)
-    results: list[dict[str, Any]] = []
-    for ticker in tickers:
-        try:
-            results.append(
-                analyze_stock(
-                    ticker,
-                    period=period,
-                    interval=interval,
-                    include_news=include_news,
-                    include_intelligence=include_intelligence,
-                    include_analyst_events=include_intelligence,
-                    force_refresh_prices=force_refresh_prices,
-                )
-            )
-        except Exception as exc:
-            results.append(
-                {
-                    "ticker": ticker,
-                    "error": str(exc),
-                    "final_score": 0,
-                    "signal": "Error",
-                    "confidence": 0,
-                    "reasons": [],
-                    "risks": ["Analysis failed before scoring."],
-                    "metadata": {
-                        "warnings": [str(exc)],
-                        "generated_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                }
-            )
-
+    results = _analyze_stocks_concurrently(
+        tickers,
+        period=period,
+        interval=interval,
+        include_news=include_news,
+        include_intelligence=include_intelligence,
+        include_analyst_events=include_intelligence,
+        force_refresh_prices=force_refresh_prices,
+    )
     ranked = sorted(results, key=lambda x: x.get("final_score", 0), reverse=True)
     if limit is not None:
         return ranked[: max(0, limit)]
@@ -203,18 +219,15 @@ def compare_stocks(
 ) -> dict[str, Any]:
     """Analyze an explicit ticker list and return ranked comparison output."""
     unique_tickers = list(dict.fromkeys(normalize_ticker(ticker) for ticker in tickers))
-    rows = [
-        analyze_stock(
-            ticker,
-            period=period,
-            interval=interval,
-            include_news=include_news,
-            include_intelligence=include_intelligence,
-            include_analyst_events=include_intelligence,
-            force_refresh_prices=force_refresh_prices,
-        )
-        for ticker in unique_tickers
-    ]
+    rows = _analyze_stocks_concurrently(
+        unique_tickers,
+        period=period,
+        interval=interval,
+        include_news=include_news,
+        include_intelligence=include_intelligence,
+        include_analyst_events=include_intelligence,
+        force_refresh_prices=force_refresh_prices,
+    )
     ranked = sorted(rows, key=lambda x: x.get("final_score", 0), reverse=True)
     return {
         "count": len(ranked),

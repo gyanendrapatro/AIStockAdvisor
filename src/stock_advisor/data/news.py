@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
-from datetime import datetime, timezone
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -13,7 +15,15 @@ import xml.etree.ElementTree as ET
 
 import yfinance as yf
 
+from stock_advisor.config.settings import settings
+
 logger = logging.getLogger(__name__)
+
+# News changes faster than daily prices but re-fetching per scanned ticker on every run is
+# the dominant cost of a multi-ticker watchlist scan (2 uncached network calls per ticker).
+# Cache it in the same SQLite file as the price cache, short-TTL.
+NEWS_CACHE_ENABLED = os.getenv("NEWS_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+NEWS_CACHE_MAX_AGE_HOURS = float(os.getenv("NEWS_CACHE_MAX_AGE_HOURS", "4"))
 
 POSITIVE_TERMS = {
     "beat",
@@ -58,9 +68,84 @@ def get_news(ticker: str, limit: int = 5) -> list[dict[str, Any]]:
     """Return free Yahoo Finance and GDELT headlines with local sentiment estimates."""
     if limit <= 0:
         return []
+    cached = _load_cached_news(ticker, limit)
+    if cached is not None:
+        return cached
     yahoo_rows = _get_yahoo_news(ticker, limit)
     gdelt_rows = _get_gdelt_news(ticker, max(2, limit // 2))
-    return _merge_news(yahoo_rows, gdelt_rows, limit)
+    merged = _merge_news(yahoo_rows, gdelt_rows, limit)
+    _store_news_cache(ticker, limit, merged)
+    return merged
+
+
+def _news_cache_connection() -> sqlite3.Connection:
+    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(settings.db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _ensure_news_cache_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS news_cache (
+            ticker TEXT NOT NULL,
+            limit_count INTEGER NOT NULL,
+            fetched_at TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            PRIMARY KEY (ticker, limit_count)
+        )
+        """
+    )
+
+
+def _load_cached_news(ticker: str, limit: int) -> list[dict[str, Any]] | None:
+    if not NEWS_CACHE_ENABLED:
+        return None
+    ticker_key = str(ticker or "").strip().upper()
+    try:
+        with _news_cache_connection() as conn:
+            _ensure_news_cache_schema(conn)
+            row = conn.execute(
+                "SELECT fetched_at, payload FROM news_cache WHERE ticker = ? AND limit_count = ?",
+                (ticker_key, limit),
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("News cache load failed for %s: %s", ticker_key, exc)
+        return None
+    if not row:
+        return None
+    try:
+        fetched_at = datetime.fromisoformat(str(row["fetched_at"]))
+    except ValueError:
+        return None
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - fetched_at
+    if age > timedelta(hours=max(0.05, NEWS_CACHE_MAX_AGE_HOURS)):
+        return None
+    try:
+        return json.loads(row["payload"])
+    except json.JSONDecodeError:
+        return None
+
+
+def _store_news_cache(ticker: str, limit: int, articles: list[dict[str, Any]]) -> None:
+    if not NEWS_CACHE_ENABLED:
+        return
+    ticker_key = str(ticker or "").strip().upper()
+    try:
+        with _news_cache_connection() as conn:
+            _ensure_news_cache_schema(conn)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO news_cache (ticker, limit_count, fetched_at, payload)
+                VALUES (?, ?, ?, ?)
+                """,
+                (ticker_key, limit, datetime.now(timezone.utc).isoformat(), json.dumps(articles)),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("News cache store failed for %s: %s", ticker_key, exc)
 
 
 def search_gdelt_articles(query: str, *, limit: int = 10, timespan: str = "30d") -> list[dict[str, Any]]:
