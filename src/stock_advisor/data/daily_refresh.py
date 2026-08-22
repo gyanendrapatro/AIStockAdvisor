@@ -47,6 +47,7 @@ def run_daily_market_data_refresh(
     retry_attempts: int = 2,
     force_refresh_prices: bool = True,
     report_path: str | Path | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Refresh public NSE/BSE inputs and local price cache for daily analytics.
 
@@ -65,6 +66,8 @@ def run_daily_market_data_refresh(
     clear_nse_index_archive_cache()
 
     if refresh_universes:
+        if progress_callback:
+            progress_callback({"phase": "universe", "message": "Refreshing universe membership..."})
         if refresh_broad_universe:
             steps["broad_nse_universe"] = _capture_step(
                 lambda: refresh_stock_universe(index_name=index_name),
@@ -87,6 +90,8 @@ def run_daily_market_data_refresh(
 
     exchange_eod_result: dict[str, Any] | None = None
     if refresh_exchange_eod and tickers:
+        if progress_callback:
+            progress_callback({"phase": "exchange_eod", "message": "Refreshing NSE/BSE EOD bhavcopy..."})
         exchange_eod_result = refresh_latest_exchange_eod_cache(
             tickers,
             interval="1d",
@@ -96,6 +101,8 @@ def run_daily_market_data_refresh(
 
     index_warm_result: dict[str, Any] | None = None
     if warm_index_cache:
+        if progress_callback:
+            progress_callback({"phase": "index_cache", "message": "Warming index caches..."})
         index_warm_result = _warm_index_history_cache(period=period, interval=interval)
         steps["index_history_cache"] = {"status": "ok", "result": index_warm_result}
 
@@ -108,6 +115,7 @@ def run_daily_market_data_refresh(
             chunk_size=chunk_size,
             retry_attempts=retry_attempts,
             force_refresh=force_refresh_prices,
+            progress_callback=progress_callback,
         )
         steps["price_history_cache"] = {"status": "ok", "result": price_warm_result}
 

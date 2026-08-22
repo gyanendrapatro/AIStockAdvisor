@@ -12,6 +12,7 @@ sys.path.append(str(Path(__file__).resolve().parents[2]))
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from stock_advisor.analysis.indicators import add_indicators
 from stock_advisor.analysis.market_analytics import (
@@ -33,7 +34,12 @@ from stock_advisor.agents.sector_rotation_workflow import run_sector_rotation_wo
 from stock_advisor.agents.stock_research_agent import run_stock_research_agent
 from stock_advisor.config.settings import load_watchlists
 from stock_advisor.data.daily_refresh import load_daily_refresh_report, run_daily_market_data_refresh
-from stock_advisor.data.market_data import get_price_cache_status, get_price_history, warm_price_history_cache
+from stock_advisor.data.market_data import (
+    get_price_cache_status,
+    get_price_history,
+    sync_stock_list_master,
+    warm_price_history_cache,
+)
 from stock_advisor.data.universe import list_sector_constituents, list_stock_universe
 
 
@@ -51,6 +57,161 @@ st.set_page_config(page_title="AI Stock Advisor", layout="wide")
 st.title("AI Stock Advisor")
 st.caption("Educational stock research dashboard. Not financial advice.")
 st.caption("Market, sector, and industry data uses official NSE/BSE EOD rows for latest candles, with free Yahoo/Stooq history fallback; no external dashboard data source is used.")
+
+
+@st.cache_resource
+def _global_refresh_jobs() -> dict[str, dict[str, object]]:
+    return {}
+
+
+def _latest_global_refresh_job() -> dict[str, object] | None:
+    jobs = [job for job in _global_refresh_jobs().values() if job.get("scope") == "global_daily_refresh"]
+    if not jobs:
+        return None
+    return sorted(jobs, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
+
+
+def _start_global_refresh_job(*, warm_universe: str, period: str = "2y", interval: str = "1d") -> dict[str, object]:
+    jobs = _global_refresh_jobs()
+    for job in jobs.values():
+        if job.get("scope") == "global_daily_refresh" and job.get("status") == "running":
+            return job
+
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    job: dict[str, object] = {
+        "id": job_id,
+        "scope": "global_daily_refresh",
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "warm_universe": warm_universe,
+        "progress": {"phase": "starting", "message": "Starting daily refresh...", "completed": 0, "total": 0},
+    }
+    jobs[job_id] = job
+
+    def _on_progress(update: dict[str, object]) -> None:
+        job["progress"] = update
+
+    def _runner() -> None:
+        try:
+            result = run_daily_market_data_refresh(
+                warm_universe=warm_universe,
+                period=period,
+                interval=interval,
+                progress_callback=_on_progress,
+            )
+            job["status"] = "completed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["result"] = result
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = "failed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["error"] = str(exc)
+
+    threading.Thread(target=_runner, name=f"global-daily-refresh-{job_id}", daemon=True).start()
+    return job
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _global_cache_universe_tickers(universe: str) -> list[str]:
+    summary = list_stock_universe(universe=universe, limit=None)
+    return [row["ticker"] for row in summary.get("stocks", []) if row.get("ticker")]
+
+
+_GLOBAL_UNIVERSE_OPTIONS = {
+    "Full NSE": "full_nse",
+    "Broad NSE Total Market": "broad",
+    "All India NSE+BSE": "all_india",
+}
+
+
+with st.container():
+    gc1, gc2, gc3 = st.columns([2, 1, 3])
+    global_universe_label = gc1.selectbox(
+        "Cache universe",
+        list(_GLOBAL_UNIVERSE_OPTIONS),
+        index=0,
+        key="global_cache_universe",
+        label_visibility="collapsed",
+    )
+    global_universe = _GLOBAL_UNIVERSE_OPTIONS[global_universe_label]
+
+    global_job = _latest_global_refresh_job()
+    global_running = bool(global_job and global_job.get("status") == "running")
+    if gc2.button("Refresh data", key="global_refresh_button", disabled=global_running):
+        _start_global_refresh_job(warm_universe=global_universe)
+        global_job = _latest_global_refresh_job()
+        global_running = True
+
+    global_tickers = _global_cache_universe_tickers(global_universe)
+    global_cache_status = get_price_cache_status(tickers=global_tickers, interval="1d")
+    if global_cache_status.get("enabled"):
+        gc_cached = global_cache_status.get("cached_ticker_count", 0)
+        gc_fresh = global_cache_status.get("fresh_ticker_count", 0)
+        gc_stale = global_cache_status.get("stale_ticker_count", 0)
+        gc_missing = global_cache_status.get("missing_ticker_count", 0)
+        gc_requested = global_cache_status.get("requested_ticker_count") or len(global_tickers)
+        gc_coverage = global_cache_status.get("fresh_coverage_pct")
+        gc_coverage_text = f"{gc_coverage}%" if gc_coverage is not None else "n/a"
+        st.caption(
+            f"SQLite price cache ({global_universe_label}): {gc_fresh}/{gc_requested} fresh ({gc_coverage_text}), "
+            f"{gc_stale} stale, {gc_missing} missing, {gc_cached} cached total."
+        )
+
+    if global_job:
+        status = str(global_job.get("status"))
+        if status == "running":
+            progress = global_job.get("progress") or {}
+            completed = progress.get("completed")
+            total = progress.get("total")
+            message = progress.get("message")
+            if completed is not None and total:
+                gc3.info(f"Refreshing... {message + ' ' if message else ''}{completed}/{total} tickers")
+            else:
+                gc3.info(f"Refreshing... {message or 'starting'}")
+            st_autorefresh(interval=2500, limit=None, key="global_refresh_autorefresh")
+        elif status == "completed":
+            global_result = global_job.get("result") or {}
+            global_cache_result = global_result.get("price_cache_status") or {}
+            gc3.success(
+                f"Last refresh completed: {global_cache_result.get('fresh_ticker_count', 0)}/"
+                f"{global_cache_result.get('requested_ticker_count', 0)} fresh."
+            )
+        elif status == "failed":
+            gc3.error(f"Last refresh failed: {global_job.get('error')}")
+    else:
+        cold_start_report = load_daily_refresh_report()
+        if cold_start_report:
+            gc3.caption(
+                f"Last refresh (previous session): {str(cold_start_report.get('completed_at', 'n/a'))[:19]}Z, "
+                f"status={cold_start_report.get('status', 'n/a')}."
+            )
+        else:
+            gc3.caption("No refresh has been run yet.")
+
+
+with st.sidebar:
+    st.subheader("Stock List Master")
+    st.caption("Consolidate data/*.csv NSE/BSE universes into the stock_list master table.")
+    _STOCK_LIST_SYNC_OPTIONS = {
+        "All universes (recommended)": None,
+        "Broad NSE Total Market": ["broad"],
+        "Full NSE Equity": ["full_nse"],
+        "Full BSE Equity": ["full_bse"],
+        "All India NSE+BSE": ["all_india"],
+    }
+    stock_list_sync_label = st.selectbox(
+        "Universe to sync from", list(_STOCK_LIST_SYNC_OPTIONS), key="stock_list_sync_universe"
+    )
+    if st.button("Update stock_list", key="stock_list_sync_button"):
+        with st.spinner("Syncing stock_list from selected universe CSV(s)..."):
+            st.session_state["stock_list_sync_result"] = sync_stock_list_master(
+                universes=_STOCK_LIST_SYNC_OPTIONS[stock_list_sync_label]
+            )
+    stock_list_sync_result = st.session_state.get("stock_list_sync_result")
+    if stock_list_sync_result:
+        st.success(f"Synced {stock_list_sync_result.get('synced_ticker_count', 0)} tickers into stock_list.")
+
+
 st.markdown(
     """
     <style>

@@ -5,7 +5,7 @@ from datetime import datetime, time, timedelta
 import logging
 import os
 import sqlite3
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -16,6 +16,7 @@ from stock_advisor.data.exchange_eod import get_latest_exchange_eod_rows
 from stock_advisor.data.sec_edgar import get_sec_fundamentals
 from stock_advisor.data.ownership import get_ownership_fundamentals
 from stock_advisor.data.stooq import get_stooq_price_history
+from stock_advisor.data.universe import UNIVERSE_COLUMNS, build_stock_master_frame
 from stock_advisor.data.yahoo_chart import get_yahoo_chart_price_history
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,7 @@ def get_price_histories(
     *,
     chunk_size: int = 80,
     force_refresh: bool = False,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Fetch OHLCV histories for many tickers using a batched Yahoo request.
 
@@ -120,6 +122,8 @@ def get_price_histories(
                 tickers_to_fetch.remove(ticker)
 
     chunk_size = max(1, int(chunk_size or 80))
+    if progress_callback:
+        progress_callback(len(results), len(unique_tickers))
     for start in range(0, len(tickers_to_fetch), chunk_size):
         chunk = tickers_to_fetch[start : start + chunk_size]
         try:
@@ -141,6 +145,8 @@ def get_price_histories(
         for fetched_ticker, frame in fetched.items():
             _store_price_history(fetched_ticker, period, interval, frame)
         results.update(fetched)
+        if progress_callback:
+            progress_callback(len(results), len(unique_tickers))
 
     for ticker, cached in stale_results.items():
         if ticker not in results:
@@ -157,19 +163,22 @@ def _load_cached_price_history(ticker: str, period: str, interval: str) -> pd.Da
     try:
         with _price_cache_connection() as conn:
             _ensure_price_cache_schema(conn)
+            ticker_id = _ticker_id(conn, ticker_key)
+            if ticker_id is None:
+                return pd.DataFrame()
             meta = conn.execute(
                 """
                 SELECT max_period_days, fetched_at
                 FROM price_cache_meta
-                WHERE ticker = ? AND interval = ?
+                WHERE ticker_id = ? AND interval = ?
                 """,
-                (ticker_key, interval),
+                (ticker_id, interval),
             ).fetchone()
             if not meta:
                 return pd.DataFrame()
             if requested_days is not None and int(meta["max_period_days"] or 0) < requested_days:
                 return pd.DataFrame()
-            params: list[Any] = [ticker_key, interval]
+            params: list[Any] = [ticker_id, interval]
             date_filter = ""
             if requested_days is not None:
                 start_date = (_current_market_datetime().date() - timedelta(days=requested_days + 7)).isoformat()
@@ -179,7 +188,7 @@ def _load_cached_price_history(ticker: str, period: str, interval: str) -> pd.Da
                 f"""
                 SELECT date, open, high, low, close, volume, provider, fetched_at
                 FROM price_history_cache
-                WHERE ticker = ? AND interval = ?{date_filter}
+                WHERE ticker_id = ? AND interval = ?{date_filter}
                 ORDER BY date
                 """,
                 params,
@@ -224,7 +233,6 @@ def _store_price_history(ticker: str, period: str, interval: str, df: pd.DataFra
 
     rows = [
         (
-            ticker_key,
             interval,
             row.date,
             None if pd.isna(row.open) else float(row.open),
@@ -237,43 +245,44 @@ def _store_price_history(ticker: str, period: str, interval: str, df: pd.DataFra
         )
         for row in cache_df.itertuples(index=False)
     ]
-    latest_date = max(row[2] for row in rows)
+    latest_date = max(row[1] for row in rows)
 
     try:
         with _price_cache_connection() as conn:
             _ensure_price_cache_schema(conn)
+            ticker_id = _ticker_id(conn, ticker_key, create=True)
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO price_history_cache
-                (ticker, interval, date, open, high, low, close, volume, provider, fetched_at)
+                (ticker_id, interval, date, open, high, low, close, volume, provider, fetched_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                rows,
+                [(ticker_id,) + row for row in rows],
             )
             existing = conn.execute(
                 """
                 SELECT max_period_days
                 FROM price_cache_meta
-                WHERE ticker = ? AND interval = ?
+                WHERE ticker_id = ? AND interval = ?
                 """,
-                (ticker_key, interval),
+                (ticker_id, interval),
             ).fetchone()
             max_period_days = max(period_days, int(existing["max_period_days"] or 0)) if existing else period_days
             row_count = conn.execute(
                 """
                 SELECT COUNT(*)
                 FROM price_history_cache
-                WHERE ticker = ? AND interval = ?
+                WHERE ticker_id = ? AND interval = ?
                 """,
-                (ticker_key, interval),
+                (ticker_id, interval),
             ).fetchone()[0]
             conn.execute(
                 """
                 INSERT OR REPLACE INTO price_cache_meta
-                (ticker, interval, max_period_days, latest_date, provider, fetched_at, row_count)
+                (ticker_id, interval, max_period_days, latest_date, provider, fetched_at, row_count)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (ticker_key, interval, max_period_days, latest_date, provider, fetched_at, int(row_count or 0)),
+                (ticker_id, interval, max_period_days, latest_date, provider, fetched_at, int(row_count or 0)),
             )
     except Exception as exc:  # noqa: BLE001
         logger.debug("Price cache store failed for %s: %s", ticker_key, exc)
@@ -362,8 +371,44 @@ def _price_cache_connection() -> sqlite3.Connection:
 def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS stock_list (
+            ticker_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL UNIQUE,
+            market TEXT NOT NULL,
+            symbol TEXT,
+            name TEXT,
+            isin TEXT,
+            sector TEXT,
+            industry TEXT,
+            basic_industry TEXT,
+            index_name TEXT,
+            source TEXT,
+            active INTEGER,
+            series TEXT,
+            free_float_market_cap REAL,
+            last_price REAL,
+            year_high REAL,
+            year_low REAL,
+            near_52w_high_pct REAL,
+            return_30d_pct REAL,
+            return_365d_pct REAL,
+            refreshed_at TEXT,
+            exchange TEXT,
+            security_id TEXT,
+            nse_ticker TEXT,
+            bse_ticker TEXT,
+            nse_security_id TEXT,
+            bse_security_id TEXT,
+            data_quality TEXT,
+            classification_source TEXT
+        )
+        """
+    )
+    _migrate_legacy_ticker_schema(conn)
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS price_history_cache (
-            ticker TEXT NOT NULL,
+            ticker_id INTEGER NOT NULL REFERENCES stock_list(ticker_id),
             interval TEXT NOT NULL,
             date TEXT NOT NULL,
             open REAL,
@@ -373,25 +418,153 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
             volume REAL,
             provider TEXT,
             fetched_at TEXT NOT NULL,
-            PRIMARY KEY (ticker, interval, date)
+            PRIMARY KEY (ticker_id, interval, date)
         )
         """
     )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS price_cache_meta (
-            ticker TEXT NOT NULL,
+            ticker_id INTEGER NOT NULL REFERENCES stock_list(ticker_id),
             interval TEXT NOT NULL,
             max_period_days INTEGER NOT NULL,
             latest_date TEXT,
             provider TEXT,
             fetched_at TEXT NOT NULL,
             row_count INTEGER NOT NULL,
-            PRIMARY KEY (ticker, interval)
+            PRIMARY KEY (ticker_id, interval)
         )
         """
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_history_cache_lookup ON price_history_cache (ticker, interval, date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_history_cache_lookup ON price_history_cache (ticker_id, interval, date)")
+
+
+def _migrate_legacy_ticker_schema(conn: sqlite3.Connection) -> None:
+    """One-time, resumable migration from the old ticker-TEXT-keyed schema to ticker_id.
+
+    Safe to call on every connection open: no-ops once migrated, and resumable if a prior
+    attempt was interrupted between the rename and the drop (it checks for the `_legacy`
+    tables first, so real cached data is never stranded under a renamed table).
+    """
+    tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    has_legacy_backup = "price_cache_meta_legacy" in tables or "price_history_cache_legacy" in tables
+
+    if not has_legacy_backup:
+        if "price_cache_meta" not in tables:
+            return  # brand new install, nothing to migrate
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(price_cache_meta)")}
+        if "ticker_id" in cols or "ticker" not in cols:
+            return  # already migrated, or an unrecognized shape — don't touch
+        logger.info("Migrating legacy price_cache_meta/price_history_cache to ticker_id schema...")
+        conn.execute("ALTER TABLE price_cache_meta RENAME TO price_cache_meta_legacy")
+        conn.execute("ALTER TABLE price_history_cache RENAME TO price_history_cache_legacy")
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO stock_list (ticker, market)
+        SELECT DISTINCT ticker, CASE WHEN ticker LIKE '%.NS' OR ticker LIKE '%.BO' THEN 'IN' ELSE 'US' END
+        FROM price_cache_meta_legacy
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO stock_list (ticker, market)
+        SELECT DISTINCT ticker, CASE WHEN ticker LIKE '%.NS' OR ticker LIKE '%.BO' THEN 'IN' ELSE 'US' END
+        FROM price_history_cache_legacy
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_cache_meta (
+            ticker_id INTEGER NOT NULL REFERENCES stock_list(ticker_id),
+            interval TEXT NOT NULL, max_period_days INTEGER NOT NULL, latest_date TEXT,
+            provider TEXT, fetched_at TEXT NOT NULL, row_count INTEGER NOT NULL,
+            PRIMARY KEY (ticker_id, interval)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO price_cache_meta (ticker_id, interval, max_period_days, latest_date, provider, fetched_at, row_count)
+        SELECT sl.ticker_id, m.interval, m.max_period_days, m.latest_date, m.provider, m.fetched_at, m.row_count
+        FROM price_cache_meta_legacy m JOIN stock_list sl ON sl.ticker = m.ticker
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_history_cache (
+            ticker_id INTEGER NOT NULL REFERENCES stock_list(ticker_id),
+            interval TEXT NOT NULL, date TEXT NOT NULL,
+            open REAL, high REAL, low REAL, close REAL, volume REAL,
+            provider TEXT, fetched_at TEXT NOT NULL,
+            PRIMARY KEY (ticker_id, interval, date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO price_history_cache (ticker_id, interval, date, open, high, low, close, volume, provider, fetched_at)
+        SELECT sl.ticker_id, h.interval, h.date, h.open, h.high, h.low, h.close, h.volume, h.provider, h.fetched_at
+        FROM price_history_cache_legacy h JOIN stock_list sl ON sl.ticker = h.ticker
+        """
+    )
+
+    conn.execute("DROP TABLE price_cache_meta_legacy")
+    conn.execute("DROP TABLE price_history_cache_legacy")
+    conn.commit()
+    logger.info("Legacy price cache migration complete.")
+
+    try:
+        sync_stock_list_master()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stock_list enrichment sync after migration failed: %s", exc)
+
+
+def _ticker_id(conn: sqlite3.Connection, ticker_key: str, *, create: bool = False) -> int | None:
+    row = conn.execute("SELECT ticker_id FROM stock_list WHERE ticker = ?", (ticker_key,)).fetchone()
+    if row:
+        return int(row["ticker_id"])
+    if not create:
+        return None
+    conn.execute(
+        "INSERT OR IGNORE INTO stock_list (ticker, market) VALUES (?, ?)",
+        (ticker_key, _infer_market(ticker_key)),
+    )
+    row = conn.execute("SELECT ticker_id FROM stock_list WHERE ticker = ?", (ticker_key,)).fetchone()
+    return int(row["ticker_id"]) if row else None
+
+
+def sync_stock_list_master(universes: list[str] | None = None) -> dict[str, Any]:
+    """Consolidate data/*.csv NSE/BSE universes into stock_list (insert new, refresh existing)."""
+    frame = build_stock_master_frame(universes=universes)
+    universes_used = list(universes) if universes else None
+    if frame.empty:
+        return {"synced_ticker_count": 0, "universes": universes_used}
+    columns = ["market"] + [c for c in UNIVERSE_COLUMNS if c != "ticker"]
+    placeholders = ", ".join(["?"] * (len(columns) + 1))
+    update_clause = ", ".join(f"{c}=excluded.{c}" for c in columns)
+    rows = [
+        (
+            record.get("ticker"),
+            _infer_market(record.get("ticker")),
+            *(record.get(c) for c in columns if c != "market"),
+        )
+        for record in frame.to_dict("records")
+    ]
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        conn.executemany(
+            f"""
+            INSERT INTO stock_list (ticker, {", ".join(columns)})
+            VALUES ({placeholders})
+            ON CONFLICT(ticker) DO UPDATE SET {update_clause}
+            """,
+            rows,
+        )
+        conn.commit()
+    return {"synced_ticker_count": len(rows), "universes": universes_used}
 
 
 def _period_days(period: str) -> int | None:
@@ -429,6 +602,12 @@ def _cache_ticker(ticker: str) -> str:
     return str(ticker or "").strip().upper()
 
 
+def _infer_market(ticker: str) -> str:
+    """Classify a ticker as India ('IN', .NS/.BO suffix) or US ('US', everything else)."""
+    upper = str(ticker or "").strip().upper()
+    return "IN" if upper.endswith(".NS") or upper.endswith(".BO") else "US"
+
+
 def _parse_cache_datetime(value: Any) -> datetime | None:
     if not value:
         return None
@@ -450,16 +629,17 @@ def get_price_cache_status(tickers: list[str] | tuple[str, ...] | None = None, i
     ticker_filter = ""
     if ticker_keys:
         placeholders = ",".join("?" for _ in ticker_keys)
-        ticker_filter = f" AND ticker IN ({placeholders})"
+        ticker_filter = f" AND sl.ticker IN ({placeholders})"
         params.extend(ticker_keys)
     try:
         with _price_cache_connection() as conn:
             _ensure_price_cache_schema(conn)
             rows = conn.execute(
                 f"""
-                SELECT ticker, row_count, latest_date, fetched_at
-                FROM price_cache_meta
-                WHERE interval = ?{ticker_filter}
+                SELECT m.row_count, m.latest_date, m.fetched_at
+                FROM price_cache_meta m
+                JOIN stock_list sl ON sl.ticker_id = m.ticker_id
+                WHERE m.interval = ?{ticker_filter}
                 """,
                 params,
             ).fetchall()
@@ -566,23 +746,38 @@ def warm_price_history_cache(
     chunk_size: int = 80,
     retry_attempts: int = 2,
     force_refresh: bool = False,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Fetch/cache OHLCV data for a ticker set and report coverage."""
     unique_tickers = list(dict.fromkeys(_cache_ticker(ticker) for ticker in tickers if _cache_ticker(ticker)))
     if not unique_tickers:
         return {"requested_ticker_count": 0, "available_ticker_count": 0, "missing_ticker_count": 0, "providers": {}}
+    total = len(unique_tickers)
     results: dict[str, pd.DataFrame] = {}
     remaining = unique_tickers
     attempts = max(1, int(retry_attempts) + 1)
-    for _attempt in range(attempts):
+    for attempt_index in range(attempts):
         if not remaining:
             break
+
+        def _on_chunk_progress(completed_in_attempt: int, _total_in_attempt: int, _attempt=attempt_index) -> None:
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "price_cache",
+                        "completed": min(total, len(results) + completed_in_attempt),
+                        "total": total,
+                        "attempt": _attempt + 1,
+                    }
+                )
+
         attempt_results = get_price_histories(
             remaining,
             period=period,
             interval=interval,
             chunk_size=chunk_size,
             force_refresh=force_refresh,
+            progress_callback=_on_chunk_progress if progress_callback else None,
         )
         results.update(attempt_results)
         remaining = [ticker for ticker in unique_tickers if ticker not in results]
