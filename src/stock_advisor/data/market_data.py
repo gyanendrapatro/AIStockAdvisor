@@ -16,7 +16,6 @@ from stock_advisor.config.settings import settings
 from stock_advisor.data.exchange_eod import get_latest_exchange_eod_rows
 from stock_advisor.data.sec_edgar import get_sec_fundamentals
 from stock_advisor.data.ownership import get_ownership_fundamentals
-from stock_advisor.data.stooq import get_stooq_price_history
 from stock_advisor.data.universe import (
     UNIVERSE_COLUMNS,
     build_stock_master_frame,
@@ -26,7 +25,6 @@ from stock_advisor.data.universe import (
     refresh_india_stock_universe,
     refresh_stock_universe,
 )
-from stock_advisor.data.yahoo_chart import get_yahoo_chart_price_history
 
 logger = logging.getLogger(__name__)
 MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
@@ -34,6 +32,7 @@ DAILY_MARKET_CLOSE_BUFFER = time(15, 45)
 PRICE_CACHE_ENABLED = os.getenv("PRICE_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 PRICE_CACHE_MAX_AGE_HOURS = float(os.getenv("PRICE_CACHE_MAX_AGE_HOURS", "8"))
 CACHEABLE_INTERVALS = {"1d", "1wk", "1mo"}
+CACHE_REFRESH_HINT = "Refresh the price cache from the sidebar to populate this."
 
 FUNDAMENTAL_KEYS = [
     "shortName",
@@ -53,43 +52,17 @@ FUNDAMENTAL_KEYS = [
 ]
 
 
-def get_price_history(ticker: str, period: str = "6mo", interval: str = "1d", *, force_refresh: bool = False) -> pd.DataFrame:
-    """Fetch OHLCV price history with free providers and fallback.
+def get_price_history(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    """Read cached OHLCV price history for a ticker.
 
-    Daily Indian equities prefer the official NSE/BSE bhavcopy for the latest
-    EOD row before falling back to Yahoo/Stooq history.
+    Pure read from price_history_cache — this never calls a market data provider and
+    never writes anything. The only place price history is ever fetched and stored is
+    fill_price_cache_for_universe(), triggered from the sidebar's "Refresh price cache"
+    button, the daily_refresh CLI, or the warm_price_history_cache MCP tool. If nothing
+    is cached yet for this ticker (or the cached period is shorter than requested), this
+    returns an empty DataFrame — callers should surface CACHE_REFRESH_HINT to the user.
     """
-    cached = _load_cached_price_history(ticker, period, interval)
-    cached = _overlay_exchange_latest_rows({ticker: cached}, period=period, interval=interval).get(_cache_ticker(ticker), cached)
-    if force_refresh and _has_exchange_latest_overlay(cached):
-        return cached
-    if not force_refresh and _cached_history_is_fresh(cached, interval):
-        return cached
-
-    df = _drop_incomplete_price_rows(_get_yahoo_price_history(ticker, period, interval), ticker, interval=interval)
-    if not df.empty:
-        df = _overlay_exchange_latest_rows({ticker: df}, period=period, interval=interval).get(_cache_ticker(ticker), df)
-        _store_price_history(ticker, period, interval, df)
-        return df
-
-    chart_fallback = _drop_incomplete_price_rows(get_yahoo_chart_price_history(ticker, period, interval), ticker, interval=interval)
-    if not chart_fallback.empty:
-        logger.info("Using Yahoo chart fallback price history for %s", ticker)
-        chart_fallback = _overlay_exchange_latest_rows({ticker: chart_fallback}, period=period, interval=interval).get(_cache_ticker(ticker), chart_fallback)
-        _store_price_history(ticker, period, interval, chart_fallback)
-        return chart_fallback
-
-    fallback = _drop_incomplete_price_rows(get_stooq_price_history(ticker, period, interval), ticker, interval=interval)
-    if not fallback.empty:
-        logger.info("Using Stooq fallback price history for %s", ticker)
-        fallback = _overlay_exchange_latest_rows({ticker: fallback}, period=period, interval=interval).get(_cache_ticker(ticker), fallback)
-        _store_price_history(ticker, period, interval, fallback)
-        return fallback
-    if not cached.empty:
-        cached.attrs["provider"] = "sqlite_cache_stale"
-        logger.info("Using stale cached price history for %s after provider fetch failed", ticker)
-        return cached
-    return fallback
+    return _load_cached_price_history(ticker, period, interval)
 
 
 def get_price_histories(
@@ -97,70 +70,24 @@ def get_price_histories(
     period: str = "6mo",
     interval: str = "1d",
     *,
-    chunk_size: int = 80,
-    force_refresh: bool = False,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Fetch OHLCV histories for many tickers using a batched Yahoo request.
+    """Read cached OHLCV histories for many tickers.
 
-    The single-ticker ``get_price_history`` path is more resilient because it has
-    fallbacks. This batched path is used for broad NSE universe analytics where
-    serial 500+ ticker downloads would make the UI unusable.
+    Pure read from price_history_cache — never fetches from a provider or writes.
+    Tickers with nothing cached are simply absent from the returned dict.
     """
     unique_tickers = list(dict.fromkeys(str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()))
     if not unique_tickers:
         return {}
 
     results: dict[str, pd.DataFrame] = {}
-    stale_results: dict[str, pd.DataFrame] = {}
-    tickers_to_fetch = []
-    for ticker in unique_tickers:
+    for index, ticker in enumerate(unique_tickers):
         cached = _load_cached_price_history(ticker, period, interval)
-        if not force_refresh and _cached_history_is_fresh(cached, interval):
+        if not cached.empty:
             results[ticker] = cached
-        else:
-            if not cached.empty:
-                stale_results[ticker] = cached
-            tickers_to_fetch.append(ticker)
-
-    exchange_updated = _overlay_exchange_latest_rows({**stale_results, **results}, period=period, interval=interval)
-    for ticker, frame in exchange_updated.items():
-        if ticker in results or ticker in stale_results:
-            results[ticker] = frame
-            if ticker in tickers_to_fetch:
-                tickers_to_fetch.remove(ticker)
-
-    chunk_size = max(1, int(chunk_size or 80))
-    if progress_callback:
-        progress_callback(len(results), len(unique_tickers))
-    for start in range(0, len(tickers_to_fetch), chunk_size):
-        chunk = tickers_to_fetch[start : start + chunk_size]
-        try:
-            raw = yf.download(
-                tickers=chunk,
-                period=period,
-                interval=interval,
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-                timeout=30,
-                group_by="ticker",
-            )
-        except Exception as exc:
-            logger.warning("Batch price history fetch failed for %s tickers: %s", len(chunk), exc)
-            continue
-        fetched = _split_yahoo_batch_history(raw, chunk, interval=interval)
-        fetched = _overlay_exchange_latest_rows(fetched, period=period, interval=interval)
-        for fetched_ticker, frame in fetched.items():
-            _store_price_history(fetched_ticker, period, interval, frame)
-        results.update(fetched)
         if progress_callback:
-            progress_callback(len(results), len(unique_tickers))
-
-    for ticker, cached in stale_results.items():
-        if ticker not in results:
-            cached.attrs["provider"] = "sqlite_cache_stale"
-            results[ticker] = cached
+            progress_callback(index + 1, len(unique_tickers))
     return results
 
 
@@ -219,7 +146,7 @@ def _load_cached_price_history(ticker: str, period: str, interval: str) -> pd.Da
     return df.drop(columns=["provider", "fetched_at"], errors="ignore")
 
 
-def _store_price_history(ticker: str, period: str, interval: str, df: pd.DataFrame) -> None:
+def _store_price_history(ticker: str, interval: str, df: pd.DataFrame) -> None:
     if df.empty or not _price_cache_allowed(interval):
         return
     required = {"date", "open", "high", "low", "close"}
@@ -229,7 +156,6 @@ def _store_price_history(ticker: str, period: str, interval: str, df: pd.DataFra
     ticker_key = _cache_ticker(ticker)
     provider = str(df.attrs.get("provider") or "unknown")
     fetched_at = _current_market_datetime().isoformat()
-    period_days = _period_days(period) or 999999
     cache_df = df.copy()
     cache_df["date"] = pd.to_datetime(cache_df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     for column in ["open", "high", "low", "close", "volume"]:
@@ -257,7 +183,10 @@ def _store_price_history(ticker: str, period: str, interval: str, df: pd.DataFra
         )
         for row in cache_df.itertuples(index=False)
     ]
-    latest_date = max(row[1] for row in rows)
+    # This batch's own span — may be an older backward-fill (start date preponed) whose dates
+    # are all before what's already cached, so it must never be treated as "the latest data".
+    batch_min_date = min(row[1] for row in rows)
+    batch_max_date = max(row[1] for row in rows)
 
     try:
         with _price_cache_connection() as conn:
@@ -271,15 +200,23 @@ def _store_price_history(ticker: str, period: str, interval: str, df: pd.DataFra
                 """,
                 [(ticker_id,) + row for row in rows],
             )
-            existing = conn.execute(
+            existing_meta = conn.execute(
                 """
-                SELECT max_period_days
+                SELECT latest_date, earliest_date
                 FROM price_cache_meta
                 WHERE ticker_id = ? AND interval = ?
                 """,
                 (ticker_id, interval),
             ).fetchone()
-            max_period_days = max(period_days, int(existing["max_period_days"] or 0)) if existing else period_days
+            existing_latest = str(existing_meta["latest_date"]) if existing_meta and existing_meta["latest_date"] else None
+            existing_earliest = str(existing_meta["earliest_date"]) if existing_meta and existing_meta["earliest_date"] else None
+            # Combine explicitly with max()/min() rather than overwriting outright — a backward-fill
+            # batch's own max/min can be older than what's already cached, and price_cache_meta must
+            # never regress latest_date/earliest_date just because this particular write was old data.
+            latest_date = max(batch_max_date, existing_latest) if existing_latest else batch_max_date
+            earliest_date = min(batch_min_date, existing_earliest) if existing_earliest else batch_min_date
+            today = _current_market_datetime().date()
+            max_period_days = max(1, (today - datetime.strptime(earliest_date, "%Y-%m-%d").date()).days)
             row_count = conn.execute(
                 """
                 SELECT COUNT(*)
@@ -291,16 +228,19 @@ def _store_price_history(ticker: str, period: str, interval: str, df: pd.DataFra
             conn.execute(
                 """
                 INSERT OR REPLACE INTO price_cache_meta
-                (ticker_id, interval, max_period_days, latest_date, provider, fetched_at, row_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (ticker_id, interval, max_period_days, latest_date, earliest_date, provider, fetched_at, row_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (ticker_id, interval, max_period_days, latest_date, provider, fetched_at, int(row_count or 0)),
+                (ticker_id, interval, max_period_days, latest_date, earliest_date, provider, fetched_at, int(row_count or 0)),
             )
 
-            latest_row = next(row for row in rows if row[1] == latest_date)
+            # price_data/live_metrics reflect this batch's OWN latest row, not the all-time latest_date
+            # above — their own ON CONFLICT ... WHERE guards below already refuse to regress if this
+            # batch happens to be an older backward-fill, so it's safe to always attempt the upsert.
+            latest_row = next(row for row in rows if row[1] == batch_max_date)
             latest_turnover = None
             if has_turnover:
-                match = cache_df.loc[cache_df["date"] == latest_date, "turnover"]
+                match = cache_df.loc[cache_df["date"] == batch_max_date, "turnover"]
                 if not match.empty and pd.notna(match.iloc[-1]):
                     latest_turnover = float(match.iloc[-1])
             conn.execute(
@@ -320,8 +260,8 @@ def _store_price_history(ticker: str, period: str, interval: str, df: pd.DataFra
                 ),
             )
 
-            if interval == "1d":
-                _refresh_live_metrics(conn, ticker_id, interval, latest_date, float(latest_row[5]))
+            if interval == "1d" and batch_max_date == latest_date:
+                _refresh_live_metrics(conn, ticker_id, interval, batch_max_date, float(latest_row[5]))
     except Exception as exc:  # noqa: BLE001
         logger.debug("Price cache store failed for %s: %s", ticker_key, exc)
 
@@ -377,8 +317,12 @@ def _refresh_live_metrics(conn: sqlite3.Connection, ticker_id: int, interval: st
     )
 
 
-def _overlay_exchange_latest_rows(frames: dict[str, pd.DataFrame], *, period: str, interval: str) -> dict[str, pd.DataFrame]:
-    """Merge latest official NSE/BSE EOD rows into existing daily histories."""
+def _overlay_exchange_latest_rows(frames: dict[str, pd.DataFrame], *, interval: str) -> dict[str, pd.DataFrame]:
+    """Merge latest official NSE/BSE EOD rows into existing daily histories and persist them.
+
+    Only called from fill_price_cache_for_universe's fetch path — this both merges the
+    overlay into the in-memory frame it returns and stores it, so it counts as a write.
+    """
     if str(interval).strip().lower() != "1d" or not frames:
         return frames
     candidate_frames = { _cache_ticker(ticker): frame for ticker, frame in frames.items() if frame is not None and not frame.empty }
@@ -401,7 +345,7 @@ def _overlay_exchange_latest_rows(frames: dict[str, pd.DataFrame], *, period: st
         if merged.empty:
             continue
         out[ticker] = merged
-        _store_price_history(ticker, period, interval, exchange_frame)
+        _store_price_history(ticker, interval, exchange_frame)
     return out
 
 
@@ -420,11 +364,6 @@ def _merge_price_history(base: pd.DataFrame, patch: pd.DataFrame) -> pd.DataFram
     merged.attrs["provider"] = str(patch.attrs.get("provider") or base.attrs.get("provider") or "exchange_eod_overlay")
     merged.attrs["exchange_trade_date"] = patch.attrs.get("exchange_trade_date")
     return merged
-
-
-def _has_exchange_latest_overlay(df: pd.DataFrame) -> bool:
-    provider = str(df.attrs.get("provider") or "")
-    return bool(df.attrs.get("exchange_trade_date")) and provider in {"nse_bhavcopy", "bse_bhavcopy"}
 
 
 def _cached_history_is_fresh(df: pd.DataFrame, interval: str) -> bool:
@@ -565,6 +504,7 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
             interval TEXT NOT NULL,
             max_period_days INTEGER NOT NULL,
             latest_date TEXT,
+            earliest_date TEXT,
             provider TEXT,
             fetched_at TEXT NOT NULL,
             row_count INTEGER NOT NULL,
@@ -572,7 +512,30 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _migrate_price_cache_meta_columns(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_price_history_cache_lookup ON price_history_cache (ticker_id, interval, date)")
+
+
+def _migrate_price_cache_meta_columns(conn: sqlite3.Connection) -> None:
+    """Add earliest_date to price_cache_meta (needed to tell whether a configured
+    PRICE_HISTORY_START_DATE has moved earlier than what's already cached) and backfill it
+    from price_history_cache for any pre-existing rows. No-ops once already migrated."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(price_cache_meta)")}
+    if not cols:
+        return  # table doesn't exist yet (handled by the CREATE TABLE IF NOT EXISTS above)
+    if "earliest_date" not in cols:
+        conn.execute("ALTER TABLE price_cache_meta ADD COLUMN earliest_date TEXT")
+    conn.execute(
+        """
+        UPDATE price_cache_meta
+        SET earliest_date = (
+            SELECT MIN(date) FROM price_history_cache h
+            WHERE h.ticker_id = price_cache_meta.ticker_id AND h.interval = price_cache_meta.interval
+        )
+        WHERE earliest_date IS NULL
+        """
+    )
+    conn.commit()
 
 
 def _migrate_stock_list_table_rename(conn: sqlite3.Connection) -> None:
@@ -876,6 +839,21 @@ def list_instrument_master_tickers(universe: str) -> list[str]:
     return [row["ticker"] for row in rows]
 
 
+def list_all_instrument_master_tickers(*, active_only: bool = True) -> list[str]:
+    """Return every ticker in instrument_master, no exchange/market predicate — guarantees full
+    coverage regardless of market/exchange data gaps. instrument_master currently has legitimate
+    rows with market='US' (e.g. AAPL, used as a benchmark) or exchange IS NULL (e.g. ^NSEI) that
+    every exchange-derived universe in list_instrument_master_tickers() above would miss.
+    active_only=True excludes only rows explicitly marked active=0 — it keeps rows where active
+    IS NULL, since some legitimate rows (the US benchmark tickers, index proxies) are NULL rather
+    than 1 today."""
+    where = "active IS NOT 0" if active_only else "1=1"
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        rows = conn.execute(f"SELECT ticker FROM instrument_master WHERE {where}").fetchall()
+    return [row["ticker"] for row in rows]
+
+
 def lookup_instrument_identity(ticker: str) -> dict[str, Any] | None:
     """Single-ticker identity lookup against instrument_master — matches on ticker, nse_ticker,
     bse_ticker, or symbol (whichever the caller happens to have). Returns isin/nse_ticker/
@@ -1143,7 +1121,6 @@ def refresh_latest_exchange_eod_cache(
     *,
     interval: str = "1d",
     lookback_days: int | None = None,
-    period: str = "1d",
 ) -> dict[str, Any]:
     """Fetch the latest official NSE/BSE bhavcopy rows and persist them locally.
 
@@ -1181,7 +1158,7 @@ def refresh_latest_exchange_eod_cache(
         providers[provider] = providers.get(provider, 0) + 1
         if trade_date:
             trade_dates[trade_date] = trade_dates.get(trade_date, 0) + 1
-        _store_price_history(ticker, period, interval, frame)
+        _store_price_history(ticker, interval, frame)
 
     missing = [ticker for ticker in unique_tickers if ticker not in rows]
     return {
@@ -1196,63 +1173,174 @@ def refresh_latest_exchange_eod_cache(
     }
 
 
-def warm_price_history_cache(
+def _most_recent_expected_trading_day() -> str:
+    """The latest calendar date price_cache_meta.latest_date should have reached, ignoring
+    market holidays (only weekends are excluded). Before the daily close buffer, "today" isn't
+    finished yet, so the expectation is yesterday (or the prior weekday)."""
+    now = _current_market_datetime()
+    expected = now.date()
+    if now.time() < DAILY_MARKET_CLOSE_BUFFER:
+        expected -= timedelta(days=1)
+    while expected.weekday() >= 5:
+        expected -= timedelta(days=1)
+    return expected.isoformat()
+
+
+def _fetch_and_store_range(chunk: list[str], start: str, end: str, interval: str) -> dict[str, pd.DataFrame]:
+    """Fetch OHLCV for a chunk of tickers over [start, end) from Yahoo, overlay the latest
+    official NSE/BSE EOD row, and persist. Only called from fill_price_cache_for_universe —
+    the one place price history is ever fetched from a provider."""
+    try:
+        raw = yf.download(
+            tickers=chunk,
+            start=start,
+            end=end,
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+            timeout=30,
+            group_by="ticker",
+        )
+    except Exception as exc:
+        logger.warning("Batch price history fetch failed for %s tickers (%s to %s): %s", len(chunk), start, end, exc)
+        return {}
+    fetched = _split_yahoo_batch_history(raw, chunk, interval=interval)
+    fetched = _overlay_exchange_latest_rows(fetched, interval=interval)
+    for ticker, frame in fetched.items():
+        _store_price_history(ticker, interval, frame)
+    return fetched
+
+
+def fill_price_cache_for_universe(
     tickers: list[str] | tuple[str, ...],
     *,
-    period: str = "2y",
     interval: str = "1d",
+    start_date: str | None = None,
     chunk_size: int = 80,
     retry_attempts: int = 2,
-    force_refresh: bool = False,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Fetch/cache OHLCV data for a ticker set and report coverage."""
+    """Incrementally fill price_history_cache for every given ticker.
+
+    This is the one place price history is ever fetched from a provider and written to
+    price_history_cache/price_cache_meta/price_data/live_metrics. Everywhere else in the app
+    (get_price_history, get_price_histories, and everything built on them) only reads whatever
+    is cached here. Triggered from the sidebar's "Refresh price cache" button, the daily_refresh
+    CLI, and the warm_price_history_cache MCP tool.
+
+    Per ticker:
+      - no price_cache_meta row at all -> full-range fetch from start_date to today.
+      - cached earliest_date is after start_date (the configured floor moved earlier than
+        what's cached) -> backward-fill fetch from start_date to the existing earliest_date.
+      - cached latest_date is behind the most recent expected trading day -> forward fetch
+        from latest_date (inclusive, to safely re-cover a possibly-incomplete last row) to today.
+      - needs both backward and forward -> treated as a full-range fetch (start_date to today);
+        INSERT OR REPLACE makes re-covering the already-cached middle harmless, and this
+        combination is rare (only right after preponing start_date while also being behind on
+        the latest day).
+      - neither -> skipped, zero network calls.
+    """
+    effective_start_date = str(start_date or settings.price_history_start_date).strip()
     unique_tickers = list(dict.fromkeys(_cache_ticker(ticker) for ticker in tickers if _cache_ticker(ticker)))
-    if not unique_tickers:
-        return {"requested_ticker_count": 0, "available_ticker_count": 0, "missing_ticker_count": 0, "providers": {}}
     total = len(unique_tickers)
-    results: dict[str, pd.DataFrame] = {}
-    remaining = unique_tickers
+    if not unique_tickers:
+        return {
+            "requested_ticker_count": 0,
+            "skipped_up_to_date_count": 0,
+            "full_fetch_count": 0,
+            "backward_fetch_count": 0,
+            "forward_fetch_count": 0,
+            "failed_count": 0,
+            "failed_tickers": [],
+        }
+
+    expected_trading_day = _most_recent_expected_trading_day()
+    end_exclusive = (_current_market_datetime().date() + timedelta(days=1)).isoformat()
+
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        placeholders = ",".join("?" for _ in unique_tickers)
+        meta_rows = conn.execute(
+            f"""
+            SELECT im.ticker AS ticker, m.latest_date AS latest_date, m.earliest_date AS earliest_date
+            FROM instrument_master im
+            LEFT JOIN price_cache_meta m ON m.ticker_id = im.ticker_id AND m.interval = ?
+            WHERE im.ticker IN ({placeholders})
+            """,
+            [interval, *unique_tickers],
+        ).fetchall()
+    meta_by_ticker = {row["ticker"]: row for row in meta_rows}
+
+    full_fetch: list[str] = []
+    backward_by_date: dict[str, list[str]] = {}
+    forward_by_date: dict[str, list[str]] = {}
+    skipped_count = 0
+    for ticker in unique_tickers:
+        meta = meta_by_ticker.get(ticker)
+        latest_date = str(meta["latest_date"]) if meta and meta["latest_date"] else None
+        if latest_date is None:
+            full_fetch.append(ticker)
+            continue
+        earliest_date = str(meta["earliest_date"]) if meta["earliest_date"] else latest_date
+        needs_forward = latest_date < expected_trading_day
+        needs_backward = earliest_date > effective_start_date
+        if needs_forward and needs_backward:
+            full_fetch.append(ticker)
+        elif needs_backward:
+            backward_by_date.setdefault(earliest_date, []).append(ticker)
+        elif needs_forward:
+            forward_by_date.setdefault(latest_date, []).append(ticker)
+        else:
+            skipped_count += 1
+
+    chunk_size = max(1, int(chunk_size or 80))
     attempts = max(1, int(retry_attempts) + 1)
-    for attempt_index in range(attempts):
-        if not remaining:
-            break
+    completed = skipped_count
+    fetched_counts = {"full_fetch": 0, "backward_fetch": 0, "forward_fetch": 0}
+    failed: list[str] = []
 
-        def _on_chunk_progress(completed_in_attempt: int, _total_in_attempt: int, _attempt=attempt_index) -> None:
-            if progress_callback:
-                progress_callback(
-                    {
-                        "phase": "price_cache",
-                        "completed": min(total, len(results) + completed_in_attempt),
-                        "total": total,
-                        "attempt": _attempt + 1,
-                    }
-                )
+    def _report(phase: str) -> None:
+        if progress_callback:
+            progress_callback({"phase": phase, "completed": completed, "total": total})
 
-        attempt_results = get_price_histories(
-            remaining,
-            period=period,
-            interval=interval,
-            chunk_size=chunk_size,
-            force_refresh=force_refresh,
-            progress_callback=_on_chunk_progress if progress_callback else None,
-        )
-        results.update(attempt_results)
-        remaining = [ticker for ticker in unique_tickers if ticker not in results]
-    providers: dict[str, int] = {}
-    for frame in results.values():
-        provider = str(frame.attrs.get("provider") or "unknown")
-        providers[provider] = providers.get(provider, 0) + 1
+    _report("classifying")
+
+    def _fetch_group(phase: str, group_tickers: list[str], start: str, end: str) -> None:
+        nonlocal completed
+        remaining = list(group_tickers)
+        for _attempt in range(attempts):
+            if not remaining:
+                break
+            still_remaining: list[str] = []
+            for chunk_start in range(0, len(remaining), chunk_size):
+                chunk = remaining[chunk_start : chunk_start + chunk_size]
+                fetched = _fetch_and_store_range(chunk, start, end, interval)
+                for ticker in chunk:
+                    if ticker in fetched:
+                        fetched_counts[phase] += 1
+                        completed += 1
+                    else:
+                        still_remaining.append(ticker)
+                _report(phase)
+            remaining = still_remaining
+        failed.extend(remaining)
+
+    if full_fetch:
+        _fetch_group("full_fetch", full_fetch, effective_start_date, end_exclusive)
+    for earliest_date, group_tickers in backward_by_date.items():
+        _fetch_group("backward_fetch", group_tickers, effective_start_date, earliest_date)
+    for latest_date, group_tickers in forward_by_date.items():
+        _fetch_group("forward_fetch", group_tickers, latest_date, end_exclusive)
+
     return {
-        "requested_ticker_count": len(unique_tickers),
-        "available_ticker_count": len(results),
-        "missing_ticker_count": max(0, len(unique_tickers) - len(results)),
-        "retry_attempts": max(0, int(retry_attempts)),
-        "force_refresh": force_refresh,
-        "period": period,
-        "interval": interval,
-        "providers": providers,
-        "missing_tickers": remaining[:50],
+        "requested_ticker_count": total,
+        "skipped_up_to_date_count": skipped_count,
+        "full_fetch_count": fetched_counts["full_fetch"],
+        "backward_fetch_count": fetched_counts["backward_fetch"],
+        "forward_fetch_count": fetched_counts["forward_fetch"],
+        "failed_count": len(failed),
+        "failed_tickers": failed[:50],
         "cache_status": get_price_cache_status(unique_tickers, interval=interval),
     }
 
@@ -1296,40 +1384,6 @@ def _normalize_yahoo_history_frame(df: pd.DataFrame) -> pd.DataFrame:
     normalized = normalized.rename(columns={column: str(column).lower().replace(" ", "_") for column in normalized.columns})
     normalized.index.name = "date"
     return normalized.reset_index()
-
-
-def _get_yahoo_price_history(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
-    try:
-        df = yf.download(
-            ticker,
-            period=period,
-            interval=interval,
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-            timeout=15,
-        )
-    except Exception as exc:
-        logger.warning("Price history fetch failed for %s: %s", ticker, exc)
-        return pd.DataFrame()
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [str(c[0]) for c in df.columns]
-
-    df = df.rename(columns={c: str(c).lower().replace(" ", "_") for c in df.columns})
-    df.index.name = "date"
-    out = df.reset_index()
-
-    required = {"date", "open", "high", "low", "close"}
-    if not required.issubset(out.columns):
-        logger.warning("Price history for %s is missing required columns: %s", ticker, sorted(required - set(out.columns)))
-        return pd.DataFrame()
-
-    out.attrs["provider"] = "yfinance"
-    return out
 
 
 def _drop_incomplete_price_rows(df: pd.DataFrame, ticker: str, *, interval: str = "1d") -> pd.DataFrame:

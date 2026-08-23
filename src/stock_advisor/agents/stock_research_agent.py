@@ -8,7 +8,6 @@ from stock_advisor.agents.ai_analyst import fallback_commentary
 from stock_advisor.agents.llm_client import load_llm_config, synthesize_with_llm
 from stock_advisor.analysis.pipeline import research_stock, sanitize_for_json
 from stock_advisor.data.exchange_filings import get_exchange_announcements
-from stock_advisor.data.market_data import refresh_latest_exchange_eod_cache
 
 try:
     from langgraph.graph import END, StateGraph
@@ -60,6 +59,11 @@ def run_stock_research_agent(
 
     LangGraph is the primary workflow engine. If it is not installed, the same
     nodes run sequentially and the result is marked as degraded.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no
+    effect: price history is always served from price_history_cache. Populate the
+    cache from the sidebar's "Refresh price cache" button, the daily_refresh CLI, or
+    the warm_price_history_cache MCP tool.
     """
     normalized = _normalize_ticker(ticker)
     state: StockResearchState = {
@@ -120,19 +124,11 @@ def _run_sequential_workflow(state: StockResearchState) -> StockResearchState:
 
 
 def _node_refresh_market_data(state: StockResearchState) -> StockResearchState:
-    warnings = list(state.get("warnings", []))
-    if state.get("force_refresh_prices") and state.get("interval") == "1d":
-        try:
-            refresh_result = refresh_latest_exchange_eod_cache([state["ticker"]], interval=state["interval"], period="1d")
-        except Exception as exc:  # noqa: BLE001
-            refresh_result = {"error": str(exc)}
-            warnings.append(f"Latest NSE/BSE EOD refresh failed before stock research: {exc}")
-    else:
-        refresh_result = {}
+    # No-op: price history is read-only here (see run_stock_research_agent's docstring).
+    # Kept as a graph node/state field for backward compatibility with existing tool callers.
     return {
         **state,
-        "latest_eod_refresh": refresh_result,
-        "warnings": warnings,
+        "latest_eod_refresh": {},
         "graph_steps": [*state.get("graph_steps", []), "refresh_market_data"],
     }
 
@@ -144,7 +140,6 @@ def _node_stock_research(state: StockResearchState) -> StockResearchState:
         interval=state.get("interval"),
         intelligence_days=int(state.get("intelligence_days", 45)),
         intelligence_strategic_days=int(state.get("intelligence_strategic_days", 365)),
-        force_refresh_prices=bool(state.get("force_refresh_prices", True)),
     )
     return {**state, "analysis": analysis, "graph_steps": [*state.get("graph_steps", []), "stock_research"]}
 

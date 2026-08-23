@@ -17,6 +17,10 @@ class Settings(BaseModel):
     default_interval: str = os.getenv("DEFAULT_INTERVAL", "1d")
     report_dir: Path = _project_path(os.getenv("REPORT_DIR", "reports"), "reports")
     db_path: Path = _project_path(os.getenv("DB_PATH", "data/advisor.sqlite"), "data/advisor.sqlite")
+    # Floor date for the price-history cache backfill (fill_price_cache_for_universe). Only the
+    # sidebar's "Refresh price cache" button, the daily_refresh CLI, and the MCP warm_price_history_cache
+    # tool ever fetch/write price history; all other code just reads whatever is cached from here on.
+    price_history_start_date: str = os.getenv("PRICE_HISTORY_START_DATE", "2024-01-01")
 
 settings = Settings()
 

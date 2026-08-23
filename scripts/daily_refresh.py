@@ -28,7 +28,11 @@ def main() -> None:
     parser.add_argument("--include-india-universe", action="store_true")
     parser.add_argument("--skip-exchange-eod", action="store_true")
     parser.add_argument("--skip-price-cache", action="store_true")
-    parser.add_argument("--no-force-refresh", action="store_true", help="Use fresh cache when available instead of forcing provider refresh.")
+    parser.add_argument(
+        "--start-date",
+        default=None,
+        help="Backfill floor for price history (YYYY-MM-DD). Defaults to PRICE_HISTORY_START_DATE from .env.",
+    )
     args = parser.parse_args()
 
     result = run_daily_market_data_refresh(
@@ -46,7 +50,7 @@ def main() -> None:
         max_price_symbols=args.max_price_symbols,
         chunk_size=args.chunk_size,
         retry_attempts=args.retry_attempts,
-        force_refresh_prices=not args.no_force_refresh,
+        start_date=args.start_date,
         report_path=args.report_path,
     )
     print(json.dumps(result, indent=2, default=str))

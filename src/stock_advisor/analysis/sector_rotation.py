@@ -8,7 +8,7 @@ import pandas as pd
 
 from stock_advisor.analysis.chart_patterns import detect_chart_patterns
 from stock_advisor.analysis.indicators import latest_indicators
-from stock_advisor.data.market_data import get_basic_fundamentals, get_price_history
+from stock_advisor.data.market_data import CACHE_REFRESH_HINT, get_basic_fundamentals, get_price_history
 from stock_advisor.data.nse_indices import get_nse_index_price_history
 
 
@@ -290,13 +290,16 @@ def get_sector_rotation(
     benchmark_metrics = _price_metrics(benchmark_prices)
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
+    if not benchmark_metrics:
+        warnings.append(f"No price history is cached for benchmark {benchmark_ticker}. {CACHE_REFRESH_HINT}")
 
     for sector_id, definition in SECTOR_DEFINITIONS.items():
         prices = _get_index_price_history(definition, period=period, interval=interval)
         metrics = _price_metrics(prices)
         if not metrics:
             warnings.append(
-                f"No index price history available for {definition['name']} ({', '.join(_index_tickers(definition))})."
+                f"No index price history is cached for {definition['name']} ({', '.join(_index_tickers(definition))}). "
+                f"{CACHE_REFRESH_HINT}"
             )
             continue
 
@@ -352,7 +355,7 @@ def rank_sector_stocks(
         prices = get_price_history(ticker, period=period, interval=interval)
         metrics = _price_metrics(prices)
         if not metrics:
-            warnings.append(f"No price history available for {ticker}.")
+            warnings.append(f"No price history is cached for {ticker}. {CACHE_REFRESH_HINT}")
             continue
         indicators = latest_indicators(prices)
         patterns = detect_chart_patterns(prices)

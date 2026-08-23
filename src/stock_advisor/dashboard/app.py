@@ -35,12 +35,14 @@ from stock_advisor.agents.stock_research_agent import run_stock_research_agent
 from stock_advisor.config.settings import load_watchlists
 from stock_advisor.data.daily_refresh import load_daily_refresh_report, run_daily_market_data_refresh
 from stock_advisor.data.market_data import (
+    CACHE_REFRESH_HINT,
     backfill_market_cap_from_yfinance,
+    fill_price_cache_for_universe,
     get_price_cache_status,
     get_price_history,
+    list_all_instrument_master_tickers,
     list_instrument_master_tickers,
     sync_instrument_master,
-    warm_price_history_cache,
 )
 from stock_advisor.data.universe import list_sector_constituents, list_stock_universe
 
@@ -51,66 +53,12 @@ SECTOR_ANALYTICS_STOCK_LIMIT = 30
 MARKET_TIMEZONE_NAME = "Asia/Kolkata"
 MARKET_TIMEZONE = ZoneInfo(MARKET_TIMEZONE_NAME)
 AUTO_REFRESH_MIN_COVERAGE_PCT = 95.0
-AUTO_REFRESH_MIN_USABLE_COVERAGE_PCT = 80.0
-AUTO_REFRESH_RETRY_COOLDOWN_MINUTES = 15
 
 
 st.set_page_config(page_title="AI Stock Advisor", layout="wide")
 st.title("AI Stock Advisor")
 st.caption("Educational stock research dashboard. Not financial advice.")
 st.caption("Market, sector, and industry data uses official NSE/BSE EOD rows for latest candles, with free Yahoo/Stooq history fallback; no external dashboard data source is used.")
-
-
-@st.cache_resource
-def _global_refresh_jobs() -> dict[str, dict[str, object]]:
-    return {}
-
-
-def _latest_global_refresh_job() -> dict[str, object] | None:
-    jobs = [job for job in _global_refresh_jobs().values() if job.get("scope") == "global_daily_refresh"]
-    if not jobs:
-        return None
-    return sorted(jobs, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
-
-
-def _start_global_refresh_job(*, warm_universe: str, period: str = "2y", interval: str = "1d") -> dict[str, object]:
-    jobs = _global_refresh_jobs()
-    for job in jobs.values():
-        if job.get("scope") == "global_daily_refresh" and job.get("status") == "running":
-            return job
-
-    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
-    job: dict[str, object] = {
-        "id": job_id,
-        "scope": "global_daily_refresh",
-        "status": "running",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "warm_universe": warm_universe,
-        "progress": {"phase": "starting", "message": "Starting daily refresh...", "completed": 0, "total": 0},
-    }
-    jobs[job_id] = job
-
-    def _on_progress(update: dict[str, object]) -> None:
-        job["progress"] = update
-
-    def _runner() -> None:
-        try:
-            result = run_daily_market_data_refresh(
-                warm_universe=warm_universe,
-                period=period,
-                interval=interval,
-                progress_callback=_on_progress,
-            )
-            job["status"] = "completed"
-            job["completed_at"] = datetime.now(timezone.utc).isoformat()
-            job["result"] = result
-        except Exception as exc:  # noqa: BLE001
-            job["status"] = "failed"
-            job["completed_at"] = datetime.now(timezone.utc).isoformat()
-            job["error"] = str(exc)
-
-    threading.Thread(target=_runner, name=f"global-daily-refresh-{job_id}", daemon=True).start()
-    return job
 
 
 @st.cache_resource
@@ -155,6 +103,53 @@ def _start_market_cap_backfill_job() -> dict[str, object]:
     return job
 
 
+@st.cache_resource
+def _price_cache_fill_jobs() -> dict[str, dict[str, object]]:
+    return {}
+
+
+def _latest_price_cache_fill_job() -> dict[str, object] | None:
+    jobs = [job for job in _price_cache_fill_jobs().values() if job.get("scope") == "price_cache_fill"]
+    if not jobs:
+        return None
+    return sorted(jobs, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
+
+
+def _start_price_cache_fill_job() -> dict[str, object]:
+    jobs = _price_cache_fill_jobs()
+    for job in jobs.values():
+        if job.get("scope") == "price_cache_fill" and job.get("status") == "running":
+            return job
+
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    job: dict[str, object] = {
+        "id": job_id,
+        "scope": "price_cache_fill",
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "progress": {"phase": "starting", "completed": 0, "total": 0},
+    }
+    jobs[job_id] = job
+
+    def _on_progress(update: dict[str, object]) -> None:
+        job["progress"] = update
+
+    def _runner() -> None:
+        try:
+            tickers = list_all_instrument_master_tickers()
+            result = fill_price_cache_for_universe(tickers, progress_callback=_on_progress)
+            job["status"] = "completed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["result"] = result
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = "failed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["error"] = str(exc)
+
+    threading.Thread(target=_runner, name=f"price-cache-fill-{job_id}", daemon=True).start()
+    return job
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def _global_cache_universe_tickers(universe: str) -> list[str]:
     # instrument_master.in_nifty_total_market tags NIFTY Total Market membership explicitly at
@@ -170,8 +165,10 @@ _GLOBAL_UNIVERSE_OPTIONS = {
 
 
 with st.container():
-    gc1, gc2, gc3 = st.columns([2, 1, 3])
-    global_universe_label = gc1.selectbox(
+    # Read-only status display — the price cache is only ever written to from the sidebar's
+    # "Refresh price cache" button (or the daily_refresh CLI / warm_price_history_cache MCP
+    # tool), never from here. This just shows current coverage for the selected universe.
+    global_universe_label = st.selectbox(
         "Cache universe",
         list(_GLOBAL_UNIVERSE_OPTIONS),
         index=0,
@@ -179,13 +176,6 @@ with st.container():
         label_visibility="collapsed",
     )
     global_universe = _GLOBAL_UNIVERSE_OPTIONS[global_universe_label]
-
-    global_job = _latest_global_refresh_job()
-    global_running = bool(global_job and global_job.get("status") == "running")
-    if gc2.button("Refresh data", key="global_refresh_button", disabled=global_running):
-        _start_global_refresh_job(warm_universe=global_universe)
-        global_job = _latest_global_refresh_job()
-        global_running = True
 
     global_tickers = _global_cache_universe_tickers(global_universe)
     global_cache_status = get_price_cache_status(tickers=global_tickers, interval="1d")
@@ -199,39 +189,18 @@ with st.container():
         gc_coverage_text = f"{gc_coverage}%" if gc_coverage is not None else "n/a"
         st.caption(
             f"SQLite price cache ({global_universe_label}): {gc_fresh}/{gc_requested} fresh ({gc_coverage_text}), "
-            f"{gc_stale} stale, {gc_missing} missing, {gc_cached} cached total."
+            f"{gc_stale} stale, {gc_missing} missing, {gc_cached} cached total. "
+            "Use 'Refresh price cache' in the sidebar to update it."
         )
 
-    if global_job:
-        status = str(global_job.get("status"))
-        if status == "running":
-            progress = global_job.get("progress") or {}
-            completed = progress.get("completed")
-            total = progress.get("total")
-            message = progress.get("message")
-            if completed is not None and total:
-                gc3.info(f"Refreshing... {message + ' ' if message else ''}{completed}/{total} tickers")
-            else:
-                gc3.info(f"Refreshing... {message or 'starting'}")
-            st_autorefresh(interval=2500, limit=None, key="global_refresh_autorefresh")
-        elif status == "completed":
-            global_result = global_job.get("result") or {}
-            global_cache_result = global_result.get("price_cache_status") or {}
-            gc3.success(
-                f"Last refresh completed: {global_cache_result.get('fresh_ticker_count', 0)}/"
-                f"{global_cache_result.get('requested_ticker_count', 0)} fresh."
-            )
-        elif status == "failed":
-            gc3.error(f"Last refresh failed: {global_job.get('error')}")
+    cold_start_report = load_daily_refresh_report()
+    if cold_start_report:
+        st.caption(
+            f"Last refresh: {str(cold_start_report.get('completed_at', 'n/a'))[:19]}Z, "
+            f"status={cold_start_report.get('status', 'n/a')}."
+        )
     else:
-        cold_start_report = load_daily_refresh_report()
-        if cold_start_report:
-            gc3.caption(
-                f"Last refresh (previous session): {str(cold_start_report.get('completed_at', 'n/a'))[:19]}Z, "
-                f"status={cold_start_report.get('status', 'n/a')}."
-            )
-        else:
-            gc3.caption("No refresh has been run yet.")
+        st.caption("No refresh has been run yet.")
 
 
 with st.sidebar:
@@ -276,6 +245,40 @@ with st.sidebar:
             )
         elif mc_status == "failed":
             st.error(f"Market cap backfill failed: {market_cap_job.get('error')}")
+
+    st.divider()
+    st.subheader("Price History Cache")
+    st.caption(
+        "Fills price_history_cache for every instrument_master ticker. Already-current tickers "
+        "are skipped; only missing/new dates are fetched. This is the only place prices are "
+        "pulled from — everywhere else in the app just reads what's cached here."
+    )
+    price_fill_job = _latest_price_cache_fill_job()
+    price_fill_running = bool(price_fill_job and price_fill_job.get("status") == "running")
+    if st.button("Refresh price cache", key="price_cache_fill_button", disabled=price_fill_running):
+        _start_price_cache_fill_job()
+        price_fill_job = _latest_price_cache_fill_job()
+        price_fill_running = True
+    if price_fill_job:
+        pf_status = str(price_fill_job.get("status"))
+        if pf_status == "running":
+            pf_progress = price_fill_job.get("progress") or {}
+            st.info(
+                f"Refreshing... phase={pf_progress.get('phase', '?')} "
+                f"{pf_progress.get('completed', 0)}/{pf_progress.get('total', 0)}"
+            )
+            st_autorefresh(interval=2500, limit=None, key="price_cache_fill_autorefresh")
+        elif pf_status == "completed":
+            pf_result = price_fill_job.get("result") or {}
+            st.success(
+                f"Done: {pf_result.get('skipped_up_to_date_count', 0)} already current, "
+                f"{pf_result.get('full_fetch_count', 0)} full-fetched, "
+                f"{pf_result.get('backward_fetch_count', 0)} back-filled (start date), "
+                f"{pf_result.get('forward_fetch_count', 0)} forward-updated (latest days), "
+                f"{pf_result.get('failed_count', 0)} failed."
+            )
+        elif pf_status == "failed":
+            st.error(f"Price cache refresh failed: {price_fill_job.get('error')}")
 
 
 st.markdown(
@@ -352,142 +355,6 @@ st.markdown(
 )
 
 
-@st.cache_resource
-def _price_refresh_jobs() -> dict[str, dict[str, object]]:
-    return {}
-
-
-def _start_price_refresh_job(
-    *,
-    scope: str,
-    tickers: list[str],
-    period: str,
-    interval: str,
-    retry_attempts: int = 2,
-    force_refresh: bool = True,
-) -> dict[str, object]:
-    jobs = _price_refresh_jobs()
-    for job in jobs.values():
-        if job.get("scope") == scope and job.get("status") == "running":
-            return job
-
-    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
-    job: dict[str, object] = {
-        "id": job_id,
-        "scope": scope,
-        "status": "running",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "ticker_count": len(tickers),
-        "period": period,
-        "interval": interval,
-        "retry_attempts": retry_attempts,
-        "force_refresh": force_refresh,
-    }
-    jobs[job_id] = job
-
-    def _runner() -> None:
-        try:
-            result = warm_price_history_cache(
-                tickers,
-                period=period,
-                interval=interval,
-                retry_attempts=retry_attempts,
-                force_refresh=force_refresh,
-            )
-            job["status"] = "completed"
-            job["completed_at"] = datetime.now(timezone.utc).isoformat()
-            job["result"] = result
-        except Exception as exc:  # noqa: BLE001
-            job["status"] = "failed"
-            job["completed_at"] = datetime.now(timezone.utc).isoformat()
-            job["error"] = str(exc)
-
-    threading.Thread(target=_runner, name=f"price-cache-refresh-{job_id}", daemon=True).start()
-    return job
-
-
-def _latest_price_refresh_job(scope: str) -> dict[str, object] | None:
-    jobs = [job for job in _price_refresh_jobs().values() if job.get("scope") == scope]
-    if not jobs:
-        return None
-    return sorted(jobs, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
-
-
-@st.cache_resource
-def _auto_market_refresh_jobs() -> dict[str, dict[str, object]]:
-    return {}
-
-
-def _auto_market_refresh_scope(warm_universe: str, expected_date: object) -> str:
-    return f"{warm_universe}:{expected_date}"
-
-
-def _latest_auto_market_refresh_job(scope: str) -> dict[str, object] | None:
-    jobs = [job for job in _auto_market_refresh_jobs().values() if job.get("scope") == scope]
-    if not jobs:
-        return None
-    return sorted(jobs, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
-
-
-def _start_auto_market_refresh_job(
-    *,
-    scope: str,
-    warm_universe: str,
-    period: str,
-    interval: str,
-    include_bse: bool,
-) -> dict[str, object]:
-    jobs = _auto_market_refresh_jobs()
-    for job in jobs.values():
-        if job.get("scope") == scope and job.get("status") == "running":
-            return job
-
-    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
-    refresh_india = warm_universe == "all_india"
-    job: dict[str, object] = {
-        "id": job_id,
-        "scope": scope,
-        "status": "running",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "warm_universe": warm_universe,
-        "period": period,
-        "interval": interval,
-        "include_bse": include_bse,
-    }
-    jobs[job_id] = job
-
-    def _runner() -> None:
-        try:
-            result = run_daily_market_data_refresh(
-                refresh_universes=False,
-                refresh_broad_universe=False,
-                refresh_full_nse_universe=False,
-                refresh_bse_universe=include_bse,
-                refresh_india_universe=refresh_india,
-                warm_price_cache=False,
-                refresh_exchange_eod=True,
-                warm_index_cache=False,
-                warm_universe=warm_universe,
-                period=period,
-                interval=interval,
-                max_universe_symbols=None,
-                max_price_symbols=None,
-                chunk_size=80,
-                retry_attempts=0,
-                force_refresh_prices=False,
-            )
-            job["status"] = "completed"
-            job["completed_at"] = datetime.now(timezone.utc).isoformat()
-            job["result"] = result
-        except Exception as exc:  # noqa: BLE001
-            job["status"] = "failed"
-            job["completed_at"] = datetime.now(timezone.utc).isoformat()
-            job["error"] = str(exc)
-
-    threading.Thread(target=_runner, daemon=True).start()
-    return job
-
-
 def _daily_refresh_universe(universe: str | None) -> str:
     normalized = str(universe or "").strip().lower()
     if normalized in {"all_india", "india", "nse_bse", "bse_nse"}:
@@ -559,56 +426,7 @@ def _latest_cache_ready_for_universe(warm_universe: str) -> tuple[bool, dict[str
     }
 
 
-def _auto_refresh_cache_key(warm_universe: str, expected_date: object) -> str:
-    return f"{warm_universe}:{expected_date}"
-
-
-def _recent_auto_refresh_report(warm_universe: str, expected_date: object) -> dict[str, object] | None:
-    attempts = st.session_state.get("auto_market_refresh_attempts") or {}
-    report = attempts.get(_auto_refresh_cache_key(warm_universe, expected_date))
-    if not isinstance(report, dict):
-        return None
-    attempted_at = report.get("attempted_at")
-    try:
-        attempted = datetime.fromisoformat(str(attempted_at))
-    except (TypeError, ValueError):
-        return None
-    if attempted.tzinfo is None:
-        attempted = attempted.replace(tzinfo=timezone.utc)
-    age = datetime.now(timezone.utc) - attempted.astimezone(timezone.utc)
-    if age <= timedelta(minutes=AUTO_REFRESH_RETRY_COOLDOWN_MINUTES):
-        return report
-    return None
-
-
-def _remember_auto_refresh_report(warm_universe: str, expected_date: object, report: dict[str, object]) -> None:
-    attempts = dict(st.session_state.get("auto_market_refresh_attempts") or {})
-    report = dict(report)
-    report["attempted_at"] = datetime.now(timezone.utc).isoformat()
-    attempts[_auto_refresh_cache_key(warm_universe, expected_date)] = report
-    st.session_state["auto_market_refresh_attempts"] = attempts
-
-
-def _usable_cached_data_report(cache_readiness: dict[str, object]) -> dict[str, object] | None:
-    cache_status = cache_readiness.get("cache_status") or {}
-    if not isinstance(cache_status, dict):
-        return None
-    coverage = _number(cache_readiness.get("latest_available_coverage_pct"))
-    if coverage is None:
-        coverage = _number(cache_readiness.get("coverage_pct"))
-    if coverage is None:
-        coverage = _number(cache_status.get("fresh_coverage_pct"))
-    latest_date = cache_readiness.get("latest_price_date") or cache_status.get("latest_price_date")
-    if coverage is None or coverage < AUTO_REFRESH_MIN_USABLE_COVERAGE_PCT or not latest_date:
-        return None
-    return {
-        "status": "skipped_using_cache",
-        "reason": "Using cached market data; automatic full refresh is not repeated on every run.",
-        **cache_readiness,
-    }
-
-
-def _ensure_latest_data_before_run(
+def _warn_if_cache_not_ready(
     label: str,
     *,
     universe: str = "full_nse",
@@ -616,83 +434,24 @@ def _ensure_latest_data_before_run(
     interval: str = "1d",
     include_bse: bool | None = None,
 ) -> dict[str, object]:
+    """Read-only cache-readiness check. Never starts a refresh — the price cache is only ever
+    written to from the sidebar's "Refresh price cache" button (or the daily_refresh CLI /
+    warm_price_history_cache MCP tool). If coverage is short, just warn and proceed with
+    whatever's cached."""
     warm_universe = _daily_refresh_universe(universe)
     cache_ready, cache_readiness = _latest_cache_ready_for_universe(warm_universe)
-    expected_date = cache_readiness.get("expected_latest_eod_date") or _expected_latest_complete_eod_date()
-    refresh_india = warm_universe == "all_india"
-    refresh_bse = refresh_india if include_bse is None else bool(include_bse)
-    refresh_scope = _auto_market_refresh_scope(warm_universe, expected_date)
     if cache_ready:
-        report = {
-            "status": "skipped",
-            "reason": "Local cache already has the latest expected complete EOD data.",
-            **cache_readiness,
-        }
-        st.session_state["latest_auto_market_refresh_report"] = report
         st.caption(
-            "Skipped market refresh: "
             f"{cache_readiness.get('coverage_pct')}% of {warm_universe} already has latest EOD "
             f"{cache_readiness.get('latest_price_date') or cache_readiness.get('expected_latest_eod_date')}."
         )
-        return report
-
-    recent_report = _recent_auto_refresh_report(warm_universe, expected_date)
-    if recent_report:
-        active_job = _latest_auto_market_refresh_job(refresh_scope)
-        report = {
-            "status": "skipped_recent_attempt",
-            "reason": "Skipped automatic refresh because this universe was already checked recently.",
-            **cache_readiness,
-            "last_attempt": recent_report,
-            "active_job": active_job,
-        }
-        st.session_state["latest_auto_market_refresh_report"] = report
-        usable = _usable_cached_data_report(cache_readiness)
-        if usable:
-            st.caption(
-                "Using cached market data through "
-                f"{cache_readiness.get('latest_price_date')} while refresh is on cooldown. "
-                "Use the explicit Refresh price data button if you want to force it."
-            )
-        else:
-            st.warning(
-                "Market data is not fully current, and automatic refresh was already attempted recently. "
-                "Continuing with available cached data."
-            )
-        return report
-
-    job = _start_auto_market_refresh_job(
-        scope=refresh_scope,
-        warm_universe=warm_universe,
-        period=period,
-        interval=interval,
-        include_bse=refresh_bse,
-    )
-    report = {
-        "status": "background_refresh_started" if job.get("status") == "running" else str(job.get("status") or "unknown"),
-        "reason": "Latest EOD data was not complete, so a background exchange-data refresh was started.",
-        **cache_readiness,
-        "refresh_job": job,
-    }
-    _remember_auto_refresh_report(warm_universe, expected_date, report)
-    usable = _usable_cached_data_report(cache_readiness)
-    if usable:
-        report = {
-            **usable,
-            "status": "background_refresh_started",
-            "refresh_job": job,
-        }
-        st.caption(
-            "Started a background latest-data check; this run is using cached data through "
-            f"{cache_readiness.get('latest_price_date')}."
-        )
     else:
         st.warning(
-            "Latest market data is missing, so a background refresh was started. "
-            "This calculation will continue with whatever cache is currently available."
+            f"Price cache for {warm_universe} isn't fully up to date "
+            f"({cache_readiness.get('coverage_pct')}% at the latest EOD date). "
+            "Refresh it from 'Price History Cache' in the sidebar. Continuing with available cached data."
         )
-    st.session_state["latest_auto_market_refresh_report"] = report
-    return report
+    return cache_readiness
 
 
 stock_tab, sector_tab, universe_tab, sector_analytics_tab, rrg_tab, industry_tab, indices_tab, breadth_tab, crossover_tab, gainers_tab = st.tabs(
@@ -1493,19 +1252,18 @@ def _rrg_points_frame(points: list[dict]) -> pd.DataFrame:
 
 with stock_tab:
     watchlists = load_watchlists()
-    c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1.2, 1.2])
+    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1.2])
     group = c1.selectbox("Watchlist", ["all"] + list(watchlists.keys()))
     period = c2.selectbox("Period", ["3mo", "6mo", "1y", "2y"], index=1)
     interval = c3.selectbox("Interval", ["1d", "1wk"], index=0)
     include_news = c4.checkbox("Include news sentiment", value=True)
-    force_refresh_prices = c5.checkbox("Force price refetch", value=False)
     c1, c2, c3 = st.columns([1, 2.2, 1])
     run = c1.button("Run scan")
     custom_ticker = c2.text_input("Analyze ticker", placeholder="AAPL or RELIANCE.NS")
     analyze_one = c3.button("Analyze ticker")
 
     if run or analyze_one:
-        _ensure_latest_data_before_run("stock scan", period=period, interval=interval)
+        _warn_if_cache_not_ready("stock scan", period=period, interval=interval)
         with st.spinner("Scanning..."):
             if analyze_one and custom_ticker.strip():
                 rows = [
@@ -1514,7 +1272,6 @@ with stock_tab:
                         period=period,
                         interval=interval,
                         include_news=include_news,
-                        force_refresh_prices=force_refresh_prices,
                     )
                 ]
             else:
@@ -1523,7 +1280,6 @@ with stock_tab:
                     period=period,
                     interval=interval,
                     include_news=include_news,
-                    force_refresh_prices=force_refresh_prices,
                 )
         if not rows:
             st.warning("No tickers are configured for this selection.")
@@ -1583,7 +1339,7 @@ with stock_tab:
         with st.expander("News", expanded=False):
             st.write(detail.get("news", []))
 
-        prices = add_indicators(get_price_history(selected, period=period, interval=interval, force_refresh=force_refresh_prices))
+        prices = add_indicators(get_price_history(selected, period=period, interval=interval))
         if not prices.empty:
             fig = go.Figure()
             fig.add_trace(
@@ -1602,7 +1358,7 @@ with stock_tab:
             fig.update_layout(height=520, margin=dict(l=10, r=10, t=20, b=10))
             st.plotly_chart(fig, width="stretch")
         else:
-            st.info("Price chart is unavailable because the market data provider returned no price history.")
+            st.info(f"No price history is cached for {selected}. {CACHE_REFRESH_HINT}")
     else:
         st.info("Choose a watchlist and run a scan, or enter a ticker.")
 
@@ -1663,7 +1419,7 @@ with sector_tab:
     run_selected_sector = st.button("Run selected sector")
 
     if run_sector or run_selected_sector:
-        _ensure_latest_data_before_run("sector rotation", period=sector_analysis_period, interval=sector_interval)
+        _warn_if_cache_not_ready("sector rotation", period=sector_analysis_period, interval=sector_interval)
         with st.spinner("Running sector workflow..."):
             st.session_state["sector_rotation_workflow_result"] = run_sector_rotation_workflow(
                 period=sector_period,
@@ -2046,57 +1802,41 @@ with universe_tab:
     if universe_source == "all_india" and not universe_summary.get("count"):
         st.warning("All India universe file is not built yet. Run `python scripts/refresh_universe.py --universe india` from the project directory, then refresh this page.")
 
-    with st.expander("Daily NSE/BSE refresh", expanded=False):
+    with st.expander("Daily NSE/BSE universe sync", expanded=False):
+        st.caption(
+            "Syncs public NSE/BSE universe CSVs and instrument_master identity data only — "
+            "it never touches price_history_cache. Refresh prices from the sidebar instead."
+        )
         last_refresh = st.session_state.get("daily_refresh_result") or load_daily_refresh_report()
-        r1, r2, r3, r4 = st.columns(4)
+        r1, r2, r3 = st.columns(3)
         r1.metric("Last status", last_refresh.get("status", "n/a") if last_refresh else "n/a")
         r2.metric("Universe stocks", last_refresh.get("universe_stock_count", 0) if last_refresh else 0)
-        r3.metric("Latest EOD", (last_refresh.get("exchange_eod") or {}).get("latest_trade_date", "n/a") if last_refresh else "n/a")
-        r4.metric("Completed", str(last_refresh.get("completed_at", "n/a"))[:10] if last_refresh else "n/a")
+        r3.metric("Completed", str(last_refresh.get("completed_at", "n/a"))[:10] if last_refresh else "n/a")
 
-        d1, d2, d3, d4 = st.columns(4)
-        daily_warm_universe_label = d1.selectbox(
-            "Warm universe",
-            ["Full NSE Equity Master", "Broad NSE Total Market", "All India NSE+BSE Master"],
-            index=0,
-            key="daily_refresh_universe",
-        )
-        daily_warm_universe = {
-            "Full NSE Equity Master": "full_nse",
-            "Broad NSE Total Market": "broad",
-            "All India NSE+BSE Master": "all_india",
-        }[daily_warm_universe_label]
-        daily_refresh_full_nse = d2.checkbox("NSE full file", value=True, key="daily_refresh_full_nse")
-        daily_refresh_broad = d3.checkbox("NSE total market", value=True, key="daily_refresh_broad")
-        daily_refresh_eod = d4.checkbox("NSE/BSE bhavcopy", value=True, key="daily_refresh_eod")
-
-        d5, d6, d7, d8 = st.columns(4)
-        daily_refresh_bse = d5.checkbox("BSE master", value=False, key="daily_refresh_bse")
-        daily_refresh_india = d6.checkbox("India master", value=False, key="daily_refresh_india")
-        daily_max_symbols = d7.number_input("Price symbols cap", min_value=0, value=0, step=100, key="daily_refresh_max_symbols")
-        daily_run = d8.button("Run daily refresh now", key="daily_refresh_run")
+        d1, d2, d3 = st.columns(3)
+        daily_refresh_full_nse = d1.checkbox("NSE full file", value=True, key="daily_refresh_full_nse")
+        daily_refresh_broad = d2.checkbox("NSE total market", value=True, key="daily_refresh_broad")
+        daily_refresh_bse = d3.checkbox("BSE master", value=False, key="daily_refresh_bse")
+        d4, d5 = st.columns(2)
+        daily_refresh_india = d4.checkbox("India master", value=False, key="daily_refresh_india")
+        daily_run = d5.button("Run universe sync now", key="daily_refresh_run")
 
         if daily_run:
-            with st.spinner("Refreshing NSE/BSE data..."):
+            with st.spinner("Syncing NSE/BSE universe data..."):
                 st.session_state["daily_refresh_result"] = run_daily_market_data_refresh(
                     refresh_broad_universe=daily_refresh_broad,
                     refresh_full_nse_universe=daily_refresh_full_nse,
                     refresh_bse_universe=daily_refresh_bse,
                     refresh_india_universe=daily_refresh_india,
-                    refresh_exchange_eod=daily_refresh_eod,
-                    warm_universe=daily_warm_universe,
-                    max_price_symbols=None if int(daily_max_symbols or 0) <= 0 else int(daily_max_symbols),
+                    refresh_exchange_eod=False,
+                    warm_price_cache=False,
+                    warm_index_cache=False,
                 )
             st.rerun()
 
         current_refresh = st.session_state.get("daily_refresh_result") or last_refresh
         if current_refresh:
-            status = current_refresh.get("price_cache_status") or {}
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Cached tickers", status.get("cached_ticker_count", 0))
-            c2.metric("Fresh tickers", status.get("fresh_ticker_count", 0))
-            c3.metric("Latest price date", status.get("latest_price_date") or "n/a")
-            with st.expander("Latest refresh report", expanded=False):
+            with st.expander("Latest sync report", expanded=False):
                 st.json(current_refresh)
 
     sector_constituent_options = {"All sectors": None}
@@ -2238,8 +1978,8 @@ with sector_analytics_tab:
                 )
                 if dominant_date and latest_date != dominant_date:
                     st.warning(
-                        "Provider data is split across dates. Sector analytics will use each stock's latest complete candle; "
-                        "run Refresh price data again after Yahoo finishes publishing complete NSE closes."
+                        "Cached data is split across dates. Sector analytics will use each stock's latest complete candle; "
+                        "refresh the price cache from the sidebar once Yahoo finishes publishing complete NSE closes."
                     )
         sector_analytics_options.update(
             {
@@ -2254,39 +1994,8 @@ with sector_analytics_tab:
     sector_analytics_selected_label = c1.selectbox("Sector drill-down", list(sector_analytics_options), key="sector_analytics_selected")
     run_sector_analytics = c2.button("Run sector analytics")
 
-    if sector_universe_tickers:
-        refresh_scope = f"{sector_analytics_universe}:{SECTOR_ANALYTICS_PERIOD}:{SECTOR_ANALYTICS_INTERVAL}:{len(sector_universe_tickers)}"
-        c1, c2 = st.columns([1, 3])
-        refresh_clicked = c1.button("Refresh price data")
-        if refresh_clicked:
-            _start_price_refresh_job(
-                scope=refresh_scope,
-                tickers=sector_universe_tickers,
-                period=SECTOR_ANALYTICS_PERIOD,
-                interval=SECTOR_ANALYTICS_INTERVAL,
-                retry_attempts=2,
-                force_refresh=True,
-            )
-        refresh_job = _latest_price_refresh_job(refresh_scope)
-        if refresh_job:
-            status = str(refresh_job.get("status"))
-            if status == "running":
-                c2.info(f"Price refresh running for {refresh_job.get('ticker_count')} stocks. You can keep using the app.")
-            elif status == "completed":
-                result = refresh_job.get("result") or {}
-                if isinstance(result, dict):
-                    cache_result = result.get("cache_status") or {}
-                    c2.success(
-                        f"Last refresh completed: {result.get('available_ticker_count', 0)}/{result.get('requested_ticker_count', 0)} available; "
-                        f"{cache_result.get('fresh_ticker_count', 0)} fresh in cache; "
-                        f"latest complete {cache_result.get('latest_price_date_count', 0)}/{cache_result.get('requested_ticker_count', 0)} "
-                        f"at {cache_result.get('latest_price_date')}."
-                    )
-            elif status == "failed":
-                c2.error(f"Last price refresh failed: {refresh_job.get('error')}")
-
     if run_sector_analytics:
-        _ensure_latest_data_before_run(
+        _warn_if_cache_not_ready(
             "sector analytics",
             universe=sector_analytics_universe,
             period=SECTOR_ANALYTICS_PERIOD,
@@ -2305,7 +2014,6 @@ with sector_analytics_tab:
                 max_stocks=SECTOR_ANALYTICS_STOCK_LIMIT,
                 universe=sector_analytics_universe,
                 refresh_universe=sector_analytics_universe == "broad",
-                force_refresh_prices=False,
             )
             st.session_state["sector_analytics_result"] = sector_analytics_result
             if sector_analytics_result.get("selected_sector_id"):
@@ -2481,7 +2189,7 @@ with sector_analytics_tab:
                         "OpenAI-compatible": "openai_compatible",
                         "Ollama/local": "ollama",
                     }[stock_agent_llm_mode]
-                    _ensure_latest_data_before_run(
+                    _warn_if_cache_not_ready(
                         f"stock research for {_display_ticker(target_ticker)}",
                         universe=sector_analytics_universe,
                         period="2y",
@@ -2501,7 +2209,6 @@ with sector_analytics_tab:
                             llm_provider=llm_provider,
                             llm_model=stock_agent_llm_model.strip() or None,
                             llm_base_url=stock_agent_llm_base_url.strip() or None,
-                            force_refresh_prices=False,
                         )
 
                 stock_agent_result = st.session_state.get("sector_stock_agent_result")
@@ -2634,7 +2341,7 @@ with rrg_tab:
     )
 
     if run_rrg:
-        _ensure_latest_data_before_run(
+        _warn_if_cache_not_ready(
             "RRG",
             period=rrg_period,
             interval={"Daily": "1d", "Weekly": "1wk"}[rrg_interval_label],
@@ -2647,7 +2354,6 @@ with rrg_tab:
                 trail_length=rrg_tail_length,
                 selected_sectors=[rrg_sector_options[label] for label in selected_rrg_sector_labels],
                 zone=rrg_zones,
-                force_refresh_prices=False,
             )
 
     rrg_result = st.session_state.get("standalone_rrg_result")
@@ -2723,7 +2429,7 @@ with rrg_tab:
             rrg_drill_label = c1.selectbox("Dive into Sector Index", list(rrg_drill_options), key="rrg_drill_sector")
             run_rrg_drill = c2.button("Rank stocks in RRG sector")
             if run_rrg_drill:
-                _ensure_latest_data_before_run(
+                _warn_if_cache_not_ready(
                     "RRG stock drill-down",
                     period=rrg_period,
                     interval={"Daily": "1d", "Weekly": "1wk"}[rrg_interval_label],
@@ -2813,7 +2519,7 @@ with industry_tab:
     run_industry_stocks = c3.button("Rank selected industry stocks")
 
     if run_industry:
-        _ensure_latest_data_before_run(
+        _warn_if_cache_not_ready(
             "industry analytics",
             universe=industry_universe,
             period=industry_period,
@@ -2828,11 +2534,10 @@ with industry_tab:
                 include_fundamentals=industry_include_fundamentals,
                 universe=industry_universe,
                 refresh_universe=industry_universe == "broad",
-                force_refresh_prices=False,
             )
 
     if run_industry_stocks and selected_industry:
-        _ensure_latest_data_before_run(
+        _warn_if_cache_not_ready(
             "industry stock ranking",
             universe=industry_universe,
             period=industry_period,
@@ -2847,7 +2552,6 @@ with industry_tab:
                 include_fundamentals=True,
                 universe=industry_universe,
                 refresh_universe=industry_universe == "broad",
-                force_refresh_prices=False,
             )
 
     industry_result = st.session_state.get("industry_analytics_result")
@@ -2975,17 +2679,15 @@ with indices_tab:
     run_indices = c3.button("Run market indices")
 
     if run_indices:
-        _ensure_latest_data_before_run("market indices", period=indices_period, interval=indices_interval)
+        _warn_if_cache_not_ready("market indices", period=indices_period, interval=indices_interval)
         with st.spinner("Fetching latest available index data..."):
             st.session_state["market_indices_result"] = get_market_indices(
                 period=indices_period,
                 interval=indices_interval,
-                force_refresh_prices=False,
             )
             st.session_state["rrg_result"] = get_relative_rotation_graph(
                 period=indices_period,
                 interval=indices_interval,
-                force_refresh_prices=False,
             )
 
     indices_result = st.session_state.get("market_indices_result")
@@ -3067,13 +2769,12 @@ with breadth_tab:
     run_breadth = st.button("Run market breadth")
 
     if run_breadth:
-        _ensure_latest_data_before_run("market breadth", period=breadth_period, interval=breadth_interval)
+        _warn_if_cache_not_ready("market breadth", period=breadth_period, interval=breadth_interval)
         with st.spinner("Checking market participation..."):
             st.session_state["market_breadth_result"] = get_market_breadth(
                 period=breadth_period,
                 interval=breadth_interval,
                 max_stocks=breadth_limit,
-                force_refresh_prices=False,
             )
 
     breadth_result = st.session_state.get("market_breadth_result")
@@ -3150,15 +2851,14 @@ with crossover_tab:
     crossover_lookback = c3.slider("Cross happened within", min_value=1, max_value=120, value=20, step=1, key="ma_cross_lookback")
     crossover_min_market_cap = c4.number_input("Market Cap >", min_value=0.0, value=0.0, step=250.0, key="ma_cross_market_cap")
 
-    s1, s2, s3, s4 = st.columns(4)
+    s1, s2, s3 = st.columns(3)
     crossover_period = s1.selectbox("Price period", ["1y", "2y", "5y"], index=1, key="ma_cross_period")
     crossover_interval = s2.selectbox("Price interval", ["1d"], index=0, key="ma_cross_interval")
     crossover_max_rows = s3.slider("Rows", min_value=25, max_value=300, value=150, step=25, key="ma_cross_rows")
-    crossover_force_refresh = s4.checkbox("Force price refetch", value=False, key="ma_cross_force_refresh")
     run_crossover_scan = st.button("Run crossover scan", key="run_ma_crossover_scan")
 
     if run_crossover_scan:
-        _ensure_latest_data_before_run(
+        _warn_if_cache_not_ready(
             "50/200 moving-average crossover scan",
             universe=crossover_universe,
             period=crossover_period,
@@ -3174,7 +2874,6 @@ with crossover_tab:
                 lookback_periods=int(crossover_lookback),
                 min_market_cap_cr=float(crossover_min_market_cap),
                 max_rows=int(crossover_max_rows),
-                force_refresh_prices=bool(crossover_force_refresh),
             )
 
     crossover_result = st.session_state.get("ma_crossover_result")
@@ -3258,7 +2957,7 @@ with gainers_tab:
     min_industry_stocks = c4.number_input("No. of stock in Industry >=", min_value=1, max_value=50, value=3, step=1)
 
     with st.expander("Data settings", expanded=False):
-        s1, s2, s3, s4, s5 = st.columns(5)
+        s1, s2, s3, s4 = st.columns(4)
         gainers_universe_label = s1.selectbox("Universe", ["Full NSE Equity Master", "Nifty Total Market", "Local configured baskets"], index=0)
         gainers_universe = {
             "Full NSE Equity Master": "full_nse",
@@ -3268,12 +2967,11 @@ with gainers_tab:
         gainers_period = s2.selectbox("Price period", ["3mo", "6mo", "1y", "2y"], index=2)
         gainers_interval = s3.selectbox("Price interval", ["1d", "1wk"], index=0)
         max_gainers = s4.slider("Overall table rows", min_value=10, max_value=150, value=60)
-        gainers_force_refresh = s5.checkbox("Force price refetch", value=False, key="top_gainers_force_refresh")
 
     run_gainers = st.button("Run top gainers")
 
     if run_gainers:
-        _ensure_latest_data_before_run(
+        _warn_if_cache_not_ready(
             "top gainers",
             universe=gainers_universe,
             period=gainers_period,
@@ -3289,7 +2987,6 @@ with gainers_tab:
                 min_industry_stocks=int(min_industry_stocks),
                 max_rows=max_gainers,
                 universe=gainers_universe,
-                force_refresh_prices=gainers_force_refresh,
             )
 
     gainers_result = st.session_state.get("top_gainers_result")

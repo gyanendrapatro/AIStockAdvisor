@@ -49,12 +49,14 @@ from stock_advisor.data.dhan import (
     get_dhan_profile as _get_dhan_profile,
 )
 from stock_advisor.data.market_data import (
+    CACHE_REFRESH_HINT,
+    fill_price_cache_for_universe as _fill_price_cache_for_universe,
     get_basic_fundamentals as _get_basic_fundamentals,
     get_price_cache_status as _get_price_cache_status,
     get_price_history as _get_price_history,
+    list_all_instrument_master_tickers as _list_all_instrument_master_tickers,
     list_instrument_master_tickers as _list_instrument_master_tickers,
     refresh_latest_exchange_eod_cache as _refresh_latest_exchange_eod_cache,
-    warm_price_history_cache as _warm_price_history_cache,
 )
 from stock_advisor.data.daily_refresh import run_daily_market_data_refresh as _run_daily_market_data_refresh
 from stock_advisor.data.news import get_news as _get_news
@@ -196,14 +198,17 @@ def analyze_stock(
     include_intelligence: bool = False,
     force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
-    """Analyze one ticker using technicals, fundamentals, news sentiment, risk, and liquidity."""
+    """Analyze one ticker using technicals, fundamentals, news sentiment, risk, and liquidity.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no effect:
+    price history is always served from price_history_cache (see get_price_history's docstring).
+    """
     return _analyze_stock(
         ticker,
         period=period,
         interval=interval,
         include_news=include_news,
         include_intelligence=include_intelligence,
-        force_refresh_prices=force_refresh_prices,
     )
 
 
@@ -216,14 +221,17 @@ def research_stock(
     intelligence_strategic_days: int = 365,
     force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
-    """Run deep stock research with company intelligence, recent events, themes, and sector fit."""
+    """Run deep stock research with company intelligence, recent events, themes, and sector fit.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no effect:
+    price history is always served from price_history_cache.
+    """
     return _research_stock(
         ticker,
         period=period,
         interval=interval,
         intelligence_days=intelligence_days,
         intelligence_strategic_days=intelligence_strategic_days,
-        force_refresh_prices=force_refresh_prices,
     )
 
 
@@ -269,7 +277,11 @@ def rank_watchlist(
     include_intelligence: bool = False,
     force_refresh_prices: bool = True,
 ) -> list[dict[str, Any]]:
-    """Rank all configured tickers or one configured watchlist group."""
+    """Rank all configured tickers or one configured watchlist group.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no effect:
+    price history is always served from price_history_cache.
+    """
     return _rank_watchlist(
         group,
         limit=limit,
@@ -277,7 +289,6 @@ def rank_watchlist(
         interval=interval,
         include_news=include_news,
         include_intelligence=include_intelligence,
-        force_refresh_prices=force_refresh_prices,
     )
 
 
@@ -290,14 +301,17 @@ def compare_stocks(
     include_intelligence: bool = False,
     force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
-    """Analyze and rank an explicit ticker list for side-by-side comparison."""
+    """Analyze and rank an explicit ticker list for side-by-side comparison.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no effect:
+    price history is always served from price_history_cache.
+    """
     return _compare_stocks(
         tickers,
         period=period,
         interval=interval,
         include_news=include_news,
         include_intelligence=include_intelligence,
-        force_refresh_prices=force_refresh_prices,
     )
 
 
@@ -373,7 +387,7 @@ def get_latest_technical_indicators(
             "indicators": indicators,
             "chart_patterns": chart_patterns,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "warnings": [] if indicators else ["No technical indicator data could be calculated."],
+            "warnings": [] if indicators else [f"No technical indicator data could be calculated for {ticker}. {CACHE_REFRESH_HINT}"],
         }
     )
 
@@ -400,7 +414,10 @@ def get_chart_patterns(
             "data_points": int(len(prices)),
             "chart_patterns": chart_patterns,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "warnings": chart_patterns.get("warnings", []),
+            "warnings": [
+                *chart_patterns.get("warnings", []),
+                *([f"No price history is cached for {ticker}. {CACHE_REFRESH_HINT}"] if prices.empty else []),
+            ],
         }
     )
 
@@ -529,9 +546,14 @@ def run_daily_market_data_refresh(
     max_price_symbols: int | None = None,
     chunk_size: int = 80,
     retry_attempts: int = 2,
-    force_refresh_prices: bool = True,
+    start_date: str | None = None,
 ) -> dict[str, Any]:
-    """Run the daily public NSE/BSE refresh job and return the JSON report."""
+    """Run the daily public NSE/BSE refresh job and return the JSON report.
+
+    Price-cache warming is incremental (fill_price_cache_for_universe): already-current
+    tickers are skipped, not re-fetched. start_date overrides PRICE_HISTORY_START_DATE
+    (from .env) as the backfill floor for this run only.
+    """
     return sanitize_for_json(
         _run_daily_market_data_refresh(
             refresh_universes=refresh_universes,
@@ -548,7 +570,7 @@ def run_daily_market_data_refresh(
             max_price_symbols=max_price_symbols,
             chunk_size=chunk_size,
             retry_attempts=retry_attempts,
-            force_refresh_prices=force_refresh_prices,
+            start_date=start_date,
         )
     )
 
@@ -569,22 +591,30 @@ def get_price_cache_status(
 @mcp.tool("warm_price_history_cache")
 def warm_price_history_cache(
     universe: str = "full_nse",
-    period: str = "2y",
+    start_date: str | None = None,
     interval: str = "1d",
     max_universe_stocks: int | None = None,
     chunk_size: int = 80,
-    force_refresh_prices: bool = True,
+    retry_attempts: int = 2,
 ) -> dict[str, Any]:
-    """Fetch and store OHLCV candles for a universe so later analytics avoid repeated provider downloads."""
-    tickers = _list_instrument_master_tickers(universe)
+    """Incrementally fill price_history_cache for a universe of tickers.
+
+    This is the same incremental engine (fill_price_cache_for_universe) the sidebar's
+    "Refresh price cache" button and the daily_refresh CLI use — already-current tickers
+    are skipped, not re-fetched; only missing/new dates get pulled. Pass universe="all" for
+    every ticker in instrument_master (no exchange/market predicate — the fullest coverage).
+    start_date overrides PRICE_HISTORY_START_DATE (from .env) as the backfill floor for this
+    run only.
+    """
+    tickers = _list_all_instrument_master_tickers() if universe == "all" else _list_instrument_master_tickers(universe)
     if max_universe_stocks is not None and max_universe_stocks > 0:
         tickers = tickers[:max_universe_stocks]
-    result = _warm_price_history_cache(
+    result = _fill_price_cache_for_universe(
         tickers,
-        period=period,
         interval=interval,
+        start_date=start_date,
         chunk_size=chunk_size,
-        force_refresh=force_refresh_prices,
+        retry_attempts=retry_attempts,
     )
     result["universe"] = universe
     result["universe_stock_count"] = len(tickers)
@@ -691,7 +721,11 @@ def get_sector_analytics(
     force_refresh_prices: bool = True,
     max_universe_stocks: int | None = None,
 ) -> dict[str, Any]:
-    """Run sector breadth analytics with MA, RS, or near-52w-high filters and drill-down rows."""
+    """Run sector breadth analytics with MA, RS, or near-52w-high filters and drill-down rows.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no effect:
+    price history is always served from price_history_cache.
+    """
     return _get_sector_analytics(
         mode=mode,
         period=period,
@@ -704,7 +738,6 @@ def get_sector_analytics(
         max_stocks=max_stocks,
         universe=universe,
         refresh_universe=refresh_universe,
-        force_refresh_prices=force_refresh_prices,
         max_universe_stocks=max_universe_stocks,
     )
 
@@ -727,7 +760,11 @@ def get_industry_analytics(
     force_refresh_prices: bool = True,
     max_universe_stocks: int | None = None,
 ) -> dict[str, Any]:
-    """Rank industries across 1D, 1W, 1M, and 3M movement for top-down analysis."""
+    """Rank industries across 1D, 1W, 1M, and 3M movement for top-down analysis.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no effect:
+    price history is always served from price_history_cache.
+    """
     return _get_industry_analytics(
         period=period,
         interval=interval,
@@ -736,7 +773,6 @@ def get_industry_analytics(
         include_fundamentals=include_fundamentals,
         universe=universe,
         refresh_universe=refresh_universe,
-        force_refresh_prices=force_refresh_prices,
         max_universe_stocks=max_universe_stocks,
     )
 
@@ -752,7 +788,11 @@ def rank_industry_stocks(
     refresh_universe: bool = False,
     force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
-    """Rank stocks inside one industry by relative strength, trend, pattern, volume, fundamentals, and risk."""
+    """Rank stocks inside one industry by relative strength, trend, pattern, volume, fundamentals, and risk.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no effect:
+    price history is always served from price_history_cache.
+    """
     return _rank_industry_stocks(
         industry,
         period=period,
@@ -761,7 +801,6 @@ def rank_industry_stocks(
         include_fundamentals=include_fundamentals,
         universe=universe,
         refresh_universe=refresh_universe,
-        force_refresh_prices=force_refresh_prices,
     )
 
 
@@ -772,8 +811,12 @@ def get_market_indices(
     max_indices: int | None = None,
     force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
-    """Return broad and sector index performance, trend, and RS metrics."""
-    return _get_market_indices(period=period, interval=interval, max_indices=max_indices, force_refresh_prices=force_refresh_prices)
+    """Return broad and sector index performance, trend, and RS metrics.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no effect:
+    price history is always served from price_history_cache.
+    """
+    return _get_market_indices(period=period, interval=interval, max_indices=max_indices)
 
 
 @mcp.tool("get_market_breadth")
@@ -783,8 +826,12 @@ def get_market_breadth(
     max_stocks: int | None = None,
     force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
-    """Return market-health breadth across configured NSE stock universe."""
-    return _get_market_breadth(period=period, interval=interval, max_stocks=max_stocks, force_refresh_prices=force_refresh_prices)
+    """Return market-health breadth across configured NSE stock universe.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no effect:
+    price history is always served from price_history_cache.
+    """
+    return _get_market_breadth(period=period, interval=interval, max_stocks=max_stocks)
 
 
 @mcp.tool("get_top_gainers")
@@ -802,7 +849,11 @@ def get_top_gainers(
     force_refresh_prices: bool = True,
     max_universe_stocks: int | None = None,
 ) -> dict[str, Any]:
-    """Rank top gaining stocks and summarize which industries are driving the move."""
+    """Rank top gaining stocks and summarize which industries are driving the move.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no effect:
+    price history is always served from price_history_cache.
+    """
     return _get_top_gainers(
         period=period,
         interval=interval,
@@ -814,7 +865,6 @@ def get_top_gainers(
         max_industries=max_industries,
         universe=universe,
         refresh_universe=refresh_universe,
-        force_refresh_prices=force_refresh_prices,
         max_universe_stocks=max_universe_stocks,
     )
 
@@ -830,7 +880,11 @@ def get_relative_rotation_graph(
     max_sectors: int | None = None,
     force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
-    """Return a ChartsMaze-style sector RRG with benchmark, zone filters, and rotation trails."""
+    """Return a ChartsMaze-style sector RRG with benchmark, zone filters, and rotation trails.
+
+    force_refresh_prices is accepted for tool-call schema compatibility but has no effect:
+    price history is always served from price_history_cache.
+    """
     return _get_relative_rotation_graph(
         period=period,
         interval=interval,
@@ -839,7 +893,6 @@ def get_relative_rotation_graph(
         selected_sectors=selected_sectors,
         zone=zone,
         max_sectors=max_sectors,
-        force_refresh_prices=force_refresh_prices,
     )
 
 
@@ -963,10 +1016,16 @@ def get_price_history(
     max_rows: int = 120,
     force_refresh: bool = True,
 ) -> dict[str, Any]:
-    """Return recent OHLCV price rows, optionally enriched with technical indicators."""
+    """Return recent OHLCV price rows, optionally enriched with technical indicators.
+
+    Prices are always served from price_history_cache (force_refresh is accepted for
+    tool-call schema compatibility but has no effect). If nothing is cached for this
+    ticker/period, populate the cache first via the warm_price_history_cache tool, the
+    daily_refresh CLI, or the sidebar's "Refresh price cache" button in the Streamlit app.
+    """
     effective_period = period or settings.default_period
     effective_interval = interval or settings.default_interval
-    df = _get_price_history(ticker, period=effective_period, interval=effective_interval, force_refresh=force_refresh)
+    df = _get_price_history(ticker, period=effective_period, interval=effective_interval)
     if include_indicators:
         df = add_indicators(df)
     capped = df.tail(max(0, min(max_rows, 500)))
@@ -979,6 +1038,7 @@ def get_price_history(
             "row_count": int(len(df)),
             "returned_rows": int(len(capped)),
             "rows": capped.to_dict(orient="records") if not capped.empty else [],
+            "warnings": [] if not df.empty else [f"No price history is cached for {ticker}. {CACHE_REFRESH_HINT}"],
         }
     )
 

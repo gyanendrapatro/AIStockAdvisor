@@ -8,7 +8,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from stock_advisor.data.market_data import get_price_history
+from stock_advisor.data.market_data import CACHE_REFRESH_HINT, get_price_history
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,7 @@ def _enrich_holding_with_market_value(holding: dict[str, Any]) -> dict[str, Any]
         return row
 
     if prices.empty or "close" not in prices.columns:
-        row["market_data_warning"] = f"No market price returned for {ticker}."
+        row["market_data_warning"] = f"No price history is cached for {ticker}. {CACHE_REFRESH_HINT}"
         return row
 
     last_close = _number(prices.iloc[-1].get("close"))

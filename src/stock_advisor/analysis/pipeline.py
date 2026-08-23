@@ -15,7 +15,7 @@ from stock_advisor.analysis.indicators import latest_indicators
 from stock_advisor.config.settings import load_watchlists, settings
 from stock_advisor.data.analyst_events import get_analyst_insights, get_stock_events
 from stock_advisor.data.company_intelligence import get_company_intelligence
-from stock_advisor.data.market_data import get_basic_fundamentals, get_price_history
+from stock_advisor.data.market_data import CACHE_REFRESH_HINT, get_basic_fundamentals, get_price_history
 from stock_advisor.data.news import get_news
 
 # Analyzing a ticker is I/O-bound (price/fundamentals/news are all network fetches), so a
@@ -34,7 +34,6 @@ def analyze_stock(
     include_analyst_events: bool = False,
     intelligence_days: int = 30,
     intelligence_strategic_days: int = 365,
-    force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
     """Analyze one stock and return JSON-safe scoring output."""
     normalized_ticker = normalize_ticker(ticker)
@@ -42,9 +41,9 @@ def analyze_stock(
     effective_interval = interval or settings.default_interval
 
     warnings: list[str] = []
-    prices = get_price_history(normalized_ticker, effective_period, effective_interval, force_refresh=force_refresh_prices)
+    prices = get_price_history(normalized_ticker, effective_period, effective_interval)
     if prices.empty:
-        warnings.append("No price history returned by market data provider.")
+        warnings.append(f"No price history is cached for {normalized_ticker}. {CACHE_REFRESH_HINT}")
 
     indicators = latest_indicators(prices)
     chart_patterns = detect_chart_patterns(prices)
@@ -100,7 +99,6 @@ def analyze_stock(
         "interval": effective_interval,
         "data_points": int(len(prices)),
         "price_provider": prices.attrs.get("provider") if not prices.empty else None,
-        "force_refresh_prices": force_refresh_prices,
         "fundamental_providers": fundamentals.get("_sources", []),
         "news_providers": sorted({str(item.get("provider")) for item in news if item.get("provider")}),
         "intelligence_providers": company_intelligence.get("providers", []),
@@ -134,7 +132,6 @@ def research_stock(
     *,
     intelligence_days: int = 30,
     intelligence_strategic_days: int = 365,
-    force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
     """Run the deeper company-intelligence analysis for one ticker."""
     return analyze_stock(
@@ -146,7 +143,6 @@ def research_stock(
         include_analyst_events=True,
         intelligence_days=intelligence_days,
         intelligence_strategic_days=intelligence_strategic_days,
-        force_refresh_prices=force_refresh_prices,
     )
 
 
@@ -189,7 +185,6 @@ def rank_watchlist(
     interval: str | None = None,
     include_news: bool = True,
     include_intelligence: bool = False,
-    force_refresh_prices: bool = True,
 ) -> list[dict[str, Any]]:
     """Analyze and rank all tickers in a watchlist group."""
     tickers = get_watchlist_tickers(group)
@@ -200,7 +195,6 @@ def rank_watchlist(
         include_news=include_news,
         include_intelligence=include_intelligence,
         include_analyst_events=include_intelligence,
-        force_refresh_prices=force_refresh_prices,
     )
     ranked = sorted(results, key=lambda x: x.get("final_score", 0), reverse=True)
     if limit is not None:
@@ -215,7 +209,6 @@ def compare_stocks(
     interval: str | None = None,
     include_news: bool = True,
     include_intelligence: bool = False,
-    force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
     """Analyze an explicit ticker list and return ranked comparison output."""
     unique_tickers = list(dict.fromkeys(normalize_ticker(ticker) for ticker in tickers))
@@ -226,7 +219,6 @@ def compare_stocks(
         include_news=include_news,
         include_intelligence=include_intelligence,
         include_analyst_events=include_intelligence,
-        force_refresh_prices=force_refresh_prices,
     )
     ranked = sorted(rows, key=lambda x: x.get("final_score", 0), reverse=True)
     return {

@@ -8,10 +8,10 @@ from typing import Any, Callable
 from stock_advisor.config.settings import PROJECT_ROOT
 from stock_advisor.data.exchange_eod import clear_exchange_eod_fetch_cache
 from stock_advisor.data.market_data import (
+    fill_price_cache_for_universe,
     get_price_cache_status,
     list_instrument_master_tickers,
     refresh_latest_exchange_eod_cache,
-    warm_price_history_cache,
 )
 from stock_advisor.data.nse_indices import clear_nse_index_archive_cache, get_nse_index_price_history
 from stock_advisor.data.universe import (
@@ -45,7 +45,7 @@ def run_daily_market_data_refresh(
     max_price_symbols: int | None = None,
     chunk_size: int = 80,
     retry_attempts: int = 2,
-    force_refresh_prices: bool = True,
+    start_date: str | None = None,
     report_path: str | Path | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -55,7 +55,12 @@ def run_daily_market_data_refresh(
     1. refreshes public universe files, including NSE equity masters;
     2. pulls the latest official NSE/BSE EOD bhavcopy row into SQLite;
     3. warms official NSE index-close archives used by RRG and index views;
-    4. warms longer OHLCV history so sector, RRG, and stock analytics run fast.
+    4. incrementally fills OHLCV history (fill_price_cache_for_universe) so sector, RRG, and
+       stock analytics run fast — already-current tickers are skipped, not re-fetched.
+
+    This is a second trigger into the same incremental engine the sidebar's "Refresh price
+    cache" button uses (via fill_price_cache_for_universe), meant for unattended/scheduled runs
+    (cron, Task Scheduler) that don't depend on the Streamlit app being open.
     """
     started_at = datetime.now(timezone.utc)
     output_path = Path(report_path) if report_path is not None else DEFAULT_DAILY_REFRESH_REPORT_PATH
@@ -96,7 +101,6 @@ def run_daily_market_data_refresh(
         exchange_eod_result = refresh_latest_exchange_eod_cache(
             tickers,
             interval="1d",
-            period="1d",
         )
         steps["exchange_eod_cache"] = {"status": "ok", "result": exchange_eod_result}
 
@@ -109,13 +113,12 @@ def run_daily_market_data_refresh(
 
     price_warm_result: dict[str, Any] | None = None
     if warm_price_cache and tickers:
-        price_warm_result = warm_price_history_cache(
+        price_warm_result = fill_price_cache_for_universe(
             tickers,
-            period=period,
             interval=interval,
+            start_date=start_date,
             chunk_size=chunk_size,
             retry_attempts=retry_attempts,
-            force_refresh=force_refresh_prices,
             progress_callback=progress_callback,
         )
         steps["price_history_cache"] = {"status": "ok", "result": price_warm_result}
@@ -144,7 +147,7 @@ def run_daily_market_data_refresh(
             "max_price_symbols": max_price_symbols,
             "chunk_size": chunk_size,
             "retry_attempts": retry_attempts,
-            "force_refresh_prices": force_refresh_prices,
+            "start_date": start_date,
         },
         "steps": steps,
         "exchange_eod": exchange_eod_result,

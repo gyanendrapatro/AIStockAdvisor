@@ -21,6 +21,7 @@ from stock_advisor.analysis.sector_rotation import (
     _score_trend,
 )
 from stock_advisor.data.market_data import (
+    CACHE_REFRESH_HINT,
     get_basic_fundamentals,
     get_price_histories,
     get_price_history,
@@ -587,10 +588,9 @@ def get_market_indices(
     period: str = "1y",
     interval: str = "1d",
     max_indices: int | None = None,
-    force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
     """Return broad/sector index performance, trend, and relative strength."""
-    benchmark_prices = get_price_history(BENCHMARK_TICKER, period=period, interval=interval, force_refresh=force_refresh_prices)
+    benchmark_prices = get_price_history(BENCHMARK_TICKER, period=period, interval=interval)
     benchmark_metrics = _price_metrics(benchmark_prices)
     rows = [
         _index_row(
@@ -605,10 +605,10 @@ def get_market_indices(
     warnings = []
 
     for sector_id, definition in _rrg_index_definitions().items():
-        prices = _rrg_price_history(definition, period=period, interval=interval, force_refresh_prices=force_refresh_prices)
+        prices = _rrg_price_history(definition, period=period, interval=interval)
         metrics = _price_metrics(prices)
         if not metrics:
-            warnings.append(f"No index data available for {definition['name']}.")
+            warnings.append(f"No price history is cached for index {definition['name']}. {CACHE_REFRESH_HINT}")
             continue
         rows.append(
             _index_row(
@@ -629,7 +629,6 @@ def get_market_indices(
             "period": period,
             "interval": interval,
             "benchmark": {"ticker": BENCHMARK_TICKER, "metrics": benchmark_metrics},
-            "force_refresh_prices": force_refresh_prices,
             "indices": ranked,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "warnings": warnings,
@@ -647,7 +646,6 @@ def get_industry_analytics(
     include_fundamentals: bool = False,
     universe: str = "local",
     refresh_universe: bool = False,
-    force_refresh_prices: bool = True,
     max_universe_stocks: int | None = None,
 ) -> dict[str, Any]:
     """Rank industries across multiple timeframes for top-down stock research."""
@@ -659,11 +657,10 @@ def get_industry_analytics(
             weighting=weighting,
             universe=universe,
             refresh_universe=refresh_universe,
-            force_refresh_prices=force_refresh_prices,
             max_universe_stocks=max_universe_stocks,
         )
 
-    benchmark_metrics = _price_metrics(get_price_history(BENCHMARK_TICKER, period=period, interval=interval, force_refresh=force_refresh_prices))
+    benchmark_metrics = _price_metrics(get_price_history(BENCHMARK_TICKER, period=period, interval=interval))
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
 
@@ -674,10 +671,11 @@ def get_industry_analytics(
             interval=interval,
             weighting=weighting,
             include_fundamentals=include_fundamentals,
-            force_refresh_prices=force_refresh_prices,
         )
         if len(stock_rows) < max(1, int(min_stocks)):
-            warnings.append(f"Skipped {definition['name']} because only {len(stock_rows)} stocks had price data.")
+            warnings.append(
+                f"Skipped {definition['name']} because only {len(stock_rows)} stocks had cached price data. {CACHE_REFRESH_HINT}"
+            )
             continue
         row = _industry_row(industry_id, definition, stock_rows, benchmark_metrics, weighting)
         rows.append(row)
@@ -698,7 +696,6 @@ def get_industry_analytics(
             "period": period,
             "interval": interval,
             "weighting": weighting,
-            "force_refresh_prices": force_refresh_prices,
             "industries": ranked,
             "top_industry": ranked[0] if ranked else None,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -721,7 +718,6 @@ def get_sector_analytics(
     max_stocks: int = 12,
     universe: str = "local",
     refresh_universe: bool = False,
-    force_refresh_prices: bool = True,
     max_universe_stocks: int | None = None,
 ) -> dict[str, Any]:
     """Return ChartsMaze-style sector breadth and drill-down using local free data."""
@@ -741,11 +737,10 @@ def get_sector_analytics(
             max_stocks=max_stocks,
             universe=universe,
             refresh_universe=refresh_universe,
-            force_refresh_prices=force_refresh_prices,
             max_universe_stocks=max_universe_stocks,
         )
 
-    benchmark_metrics = _price_metrics(get_price_history(BENCHMARK_TICKER, period=period, interval=interval, force_refresh=force_refresh_prices))
+    benchmark_metrics = _price_metrics(get_price_history(BENCHMARK_TICKER, period=period, interval=interval))
     sectors = []
     stock_rows_by_sector: dict[str, list[dict[str, Any]]] = {}
     warnings = []
@@ -761,7 +756,6 @@ def get_sector_analytics(
             ma_filter=ma_filter,
             rs_cutoff=rs_cutoff,
             near_high_pct=near_high_pct,
-            force_refresh_prices=force_refresh_prices,
         )
         if not stock_rows:
             warnings.append(f"No stock data available for {definition['name']}.")
@@ -798,7 +792,6 @@ def get_sector_analytics(
             "period": period,
             "interval": interval,
             "calculation_version": SECTOR_ANALYTICS_VERSION,
-            "force_refresh_prices": force_refresh_prices,
             "price_history_end_date": _latest_stock_date(all_stock_rows),
             "min_sector_stocks_for_ranking": MIN_SECTOR_STOCKS_FOR_RANKING,
             "sectors": sectors,
@@ -831,7 +824,6 @@ def _get_broad_sector_analytics(
     max_stocks: int,
     universe: str,
     refresh_universe: bool,
-    force_refresh_prices: bool,
     max_universe_stocks: int | None,
 ) -> dict[str, Any]:
     normalized_universe = _normalize_universe(universe)
@@ -848,13 +840,12 @@ def _get_broad_sector_analytics(
             selected_sector=selected_sector,
             max_stocks=max_stocks,
             universe="local",
-            force_refresh_prices=force_refresh_prices,
         )
         result["warnings"] = ["Broad NSE universe is unavailable; fell back to configured local baskets.", *result.get("warnings", [])]
         result["universe"] = "local_fallback"
         return result
 
-    benchmark_metrics = _price_metrics(get_price_history(BENCHMARK_TICKER, period=period, interval=interval, force_refresh=force_refresh_prices))
+    benchmark_metrics = _price_metrics(get_price_history(BENCHMARK_TICKER, period=period, interval=interval))
     stock_rows = _broad_sector_stock_rows(
         universe_df,
         benchmark_metrics=benchmark_metrics,
@@ -864,7 +855,6 @@ def _get_broad_sector_analytics(
         ma_filter=ma_filter,
         rs_cutoff=rs_cutoff,
         near_high_pct=near_high_pct,
-        force_refresh_prices=force_refresh_prices,
     )
     sectors: list[dict[str, Any]] = []
     stock_rows_by_sector: dict[str, list[dict[str, Any]]] = {}
@@ -901,7 +891,6 @@ def _get_broad_sector_analytics(
             "period": period,
             "interval": interval,
             "calculation_version": SECTOR_ANALYTICS_VERSION,
-            "force_refresh_prices": force_refresh_prices,
             "universe": normalized_universe,
             "universe_source": (
                 "Local data/sectors CSV taxonomy for sector and industry membership + free Yahoo history when required"
@@ -940,7 +929,6 @@ def _get_broad_industry_analytics(
     weighting: str,
     universe: str,
     refresh_universe: bool,
-    force_refresh_prices: bool,
     max_universe_stocks: int | None,
 ) -> dict[str, Any]:
     universe_df = load_stock_universe_from_db(universe, refresh=refresh_universe, max_stocks=max_universe_stocks)
@@ -951,14 +939,13 @@ def _get_broad_industry_analytics(
             min_stocks=min_stocks,
             weighting=weighting,
             universe="local",
-            force_refresh_prices=force_refresh_prices,
         )
         result["warnings"] = ["Broad NSE universe is unavailable; fell back to configured local industry groups.", *result.get("warnings", [])]
         result["universe"] = "local_fallback"
         return result
 
-    benchmark_metrics = _price_metrics(get_price_history(BENCHMARK_TICKER, period=period, interval=interval, force_refresh=force_refresh_prices))
-    price_map = get_price_histories(list(universe_df["ticker"]), period=period, interval=interval, force_refresh=force_refresh_prices)
+    benchmark_metrics = _price_metrics(get_price_history(BENCHMARK_TICKER, period=period, interval=interval))
+    price_map = get_price_histories(list(universe_df["ticker"]), period=period, interval=interval)
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
     for industry_name, industry_df in universe_df.groupby("basic_industry", dropna=False):
@@ -985,7 +972,7 @@ def _get_broad_industry_analytics(
         rows.append(_industry_row(_industry_slug(definition["name"]), definition, stock_rows, benchmark_metrics, weighting))
 
     if not rows:
-        warnings.append("No broad industry groups had enough price data for the selected filters.")
+        warnings.append(f"No broad industry groups had enough cached price data for the selected filters. {CACHE_REFRESH_HINT}")
     _apply_ranks(rows, "return_1d", "rank_1d")
     _apply_ranks(rows, "return_5d", "rank_1w")
     _apply_ranks(rows, "return_20d", "rank_1m")
@@ -1002,7 +989,6 @@ def _get_broad_industry_analytics(
             "period": period,
             "interval": interval,
             "weighting": weighting,
-            "force_refresh_prices": force_refresh_prices,
             "universe": "broad",
             "universe_source": "NSE NIFTY TOTAL MARKET metadata + batched free Yahoo history",
             "universe_stock_count": int(len(universe_df)),
@@ -1024,7 +1010,6 @@ def rank_industry_stocks(
     include_fundamentals: bool = True,
     universe: str = "local",
     refresh_universe: bool = False,
-    force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
     """Rank stocks inside one industry by relative strength and setup quality."""
     if _normalize_universe(universe) != "local":
@@ -1036,7 +1021,6 @@ def rank_industry_stocks(
             include_fundamentals=include_fundamentals,
             universe=universe,
             refresh_universe=refresh_universe,
-            force_refresh_prices=force_refresh_prices,
         )
 
     industry_id, definition = _resolve_industry(industry)
@@ -1046,16 +1030,15 @@ def rank_industry_stocks(
         interval=interval,
         weighting="equal",
         include_fundamentals=False,
-        force_refresh_prices=force_refresh_prices,
     )
     industry_metrics = _aggregate_metrics(stock_metrics, "equal")
     ranked = []
     warnings = []
     for ticker in list(definition["stocks"])[: max(1, int(max_stocks))]:
-        prices = get_price_history(ticker, period=period, interval=interval, force_refresh=force_refresh_prices)
+        prices = get_price_history(ticker, period=period, interval=interval)
         metrics = _price_metrics(prices)
         if not metrics:
-            warnings.append(f"No price history available for {ticker}.")
+            warnings.append(f"No price history is cached for {ticker}. {CACHE_REFRESH_HINT}")
             continue
         indicators = latest_indicators(prices)
         patterns = detect_chart_patterns(prices)
@@ -1070,7 +1053,6 @@ def rank_industry_stocks(
             "sector": definition["sector"],
             "period": period,
             "interval": interval,
-            "force_refresh_prices": force_refresh_prices,
             "stocks": ranked,
             "top_stock": ranked[0] if ranked else None,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1088,12 +1070,11 @@ def _rank_broad_industry_stocks(
     include_fundamentals: bool,
     universe: str,
     refresh_universe: bool,
-    force_refresh_prices: bool,
 ) -> dict[str, Any]:
     universe_df = load_stock_universe_from_db(universe, refresh=refresh_universe)
     industry_id, industry_df = _resolve_broad_industry(industry, universe_df)
     tickers = list(industry_df["ticker"])
-    price_map = get_price_histories(tickers, period=period, interval=interval, force_refresh=force_refresh_prices)
+    price_map = get_price_histories(tickers, period=period, interval=interval)
     stock_metrics = []
     for ticker in tickers:
         metrics = _price_metrics(price_map.get(ticker))
@@ -1109,7 +1090,7 @@ def _rank_broad_industry_stocks(
         fundamentals = get_basic_fundamentals(ticker) if include_fundamentals else {}
         ranked.append(_score_sector_stock(ticker, row, industry_metrics, indicators, patterns, fundamentals))
     if not ranked:
-        warnings.append(f"No price history available for broad industry {industry}.")
+        warnings.append(f"No price history is cached for broad industry {industry}. {CACHE_REFRESH_HINT}")
     ranked = sorted(ranked, key=lambda row: row["stock_score"], reverse=True)[: max(1, int(max_stocks))]
     return _json_safe(
         {
@@ -1118,7 +1099,6 @@ def _rank_broad_industry_stocks(
             "sector": str(industry_df["sector"].iloc[0]),
             "period": period,
             "interval": interval,
-            "force_refresh_prices": force_refresh_prices,
             "universe": "broad",
             "stocks": ranked,
             "top_stock": ranked[0] if ranked else None,
@@ -1133,10 +1113,9 @@ def get_market_breadth(
     period: str = "1y",
     interval: str = "1d",
     max_stocks: int | None = None,
-    force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
     """Measure market health using stocks above key averages and positive return windows."""
-    rows = _universe_stock_rows(period=period, interval=interval, max_stocks=max_stocks, force_refresh_prices=force_refresh_prices)
+    rows = _universe_stock_rows(period=period, interval=interval, max_stocks=max_stocks)
     summary = _breadth_summary(rows)
     groups = []
     by_sector: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1151,7 +1130,6 @@ def get_market_breadth(
         {
             "period": period,
             "interval": interval,
-            "force_refresh_prices": force_refresh_prices,
             "summary": summary,
             "sectors": sorted(groups, key=lambda row: _number(row.get("above_50_pct"), -1), reverse=True),
             "stocks": rows,
@@ -1171,7 +1149,6 @@ def get_moving_average_crossover_scan(
     min_market_cap_cr: float = 0.0,
     max_rows: int = 150,
     refresh_universe: bool = False,
-    force_refresh_prices: bool = True,
     max_universe_stocks: int | None = None,
 ) -> dict[str, Any]:
     """Scan the selected universe for fresh 50-DMA / 200-DMA crossover events."""
@@ -1207,7 +1184,7 @@ def get_moving_average_crossover_scan(
         records = records[: max(0, int(max_universe_stocks))]
 
     tickers = [str(record.get("ticker") or "").strip().upper() for record in records if str(record.get("ticker") or "").strip()]
-    price_map = get_price_histories(tickers, period=period, interval=interval, force_refresh=force_refresh_prices)
+    price_map = get_price_histories(tickers, period=period, interval=interval)
 
     source_rows: list[dict[str, Any]] = []
     signal_rows: list[dict[str, Any]] = []
@@ -1275,7 +1252,6 @@ def get_moving_average_crossover_scan(
             "direction": normalized_direction,
             "lookback_periods": max(1, int(lookback_periods)),
             "min_market_cap_cr": min_market_cap,
-            "force_refresh_prices": force_refresh_prices,
             "price_history_end_date": _latest_stock_date(source_rows),
             "stocks": limited_rows,
             "sector_summary": sector_summary,
@@ -1303,7 +1279,6 @@ def get_top_gainers(
     max_industries: int = 20,
     universe: str = "full_nse",
     refresh_universe: bool = False,
-    force_refresh_prices: bool = True,
     max_universe_stocks: int | None = None,
 ) -> dict[str, Any]:
     """Rank top gaining stocks and summarize which industries are driving the move."""
@@ -1312,7 +1287,7 @@ def get_top_gainers(
     warnings: list[str] = []
 
     if normalized_universe == "local":
-        source_rows = _universe_stock_rows(period=period, interval=interval, max_stocks=max_universe_stocks, force_refresh_prices=force_refresh_prices)
+        source_rows = _universe_stock_rows(period=period, interval=interval, max_stocks=max_universe_stocks)
         universe_refreshed_at = None
         universe_stock_count = len(source_rows)
         universe_source = "Configured local industry baskets"
@@ -1327,7 +1302,6 @@ def get_top_gainers(
                 period=period,
                 interval=interval,
                 max_stocks=max_universe_stocks,
-                force_refresh_prices=force_refresh_prices,
             )
             universe_refreshed_at = None
             universe_stock_count = len(source_rows)
@@ -1338,7 +1312,6 @@ def get_top_gainers(
                 list(universe_df["ticker"]),
                 period=period,
                 interval=interval,
-                force_refresh=force_refresh_prices,
             )
             source_rows = []
             for record in universe_df.to_dict(orient="records"):
@@ -1411,7 +1384,6 @@ def get_top_gainers(
             "min_return_pct": min_return_pct,
             "market_cap_min": market_cap_min,
             "min_industry_stocks": min_industry_stocks,
-            "force_refresh_prices": force_refresh_prices,
             "universe": normalized_universe,
             "universe_source": universe_source,
             "universe_refreshed_at": universe_refreshed_at,
@@ -1509,7 +1481,6 @@ def get_relative_rotation_graph(
     selected_sectors: list[str] | str | None = None,
     zone: list[str] | str | None = None,
     max_sectors: int | None = None,
-    force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
     """Return a ChartsMaze-style RRG sector map with recent rotation trails."""
     benchmark_ticker, benchmark_name = _resolve_rrg_benchmark(benchmark)
@@ -1521,7 +1492,6 @@ def get_relative_rotation_graph(
         benchmark_name,
         period=period,
         interval=interval,
-        force_refresh_prices=force_refresh_prices,
     )
     benchmark_close = _rrg_close_series(benchmark_prices)
     warnings: list[str] = []
@@ -1529,12 +1499,12 @@ def get_relative_rotation_graph(
     trails: list[dict[str, Any]] = []
 
     if benchmark_close.empty:
-        warnings.append(f"No benchmark price history available for {benchmark_name} ({benchmark_ticker}).")
+        warnings.append(f"No price history is cached for benchmark {benchmark_name} ({benchmark_ticker}). {CACHE_REFRESH_HINT}")
 
     for sector_id, definition in _rrg_index_definitions().items():
         if selected_sector_ids and sector_id not in selected_sector_ids:
             continue
-        prices = _rrg_price_history(definition, period=period, interval=interval, force_refresh_prices=force_refresh_prices)
+        prices = _rrg_price_history(definition, period=period, interval=interval)
         trail_points = _rrg_sector_trail(
             sector_id,
             definition,
@@ -1544,7 +1514,7 @@ def get_relative_rotation_graph(
             interval=interval,
         )
         if not trail_points:
-            warnings.append(f"No RRG trail could be calculated for {definition['name']}.")
+            warnings.append(f"No RRG trail could be calculated for {definition['name']} — no price history is cached. {CACHE_REFRESH_HINT}")
             continue
         current = trail_points[-1]
         if selected_zones and current["quadrant"] not in selected_zones:
@@ -1582,7 +1552,6 @@ def get_relative_rotation_graph(
             "interval": interval,
             "benchmark": benchmark_ticker,
             "benchmark_name": benchmark_name,
-            "force_refresh_prices": force_refresh_prices,
             "trail_length": trail_length,
             "selected_zones": sorted(selected_zones) if selected_zones else ["Leading", "Improving", "Lagging", "Weakening"],
             "points": points,
@@ -1656,9 +1625,8 @@ def _broad_sector_stock_rows(
     ma_filter: dict[str, Any],
     rs_cutoff: float,
     near_high_pct: float,
-    force_refresh_prices: bool,
 ) -> list[dict[str, Any]]:
-    price_map = get_price_histories(list(universe_df["ticker"]), period=period, interval=interval, force_refresh=force_refresh_prices)
+    price_map = get_price_histories(list(universe_df["ticker"]), period=period, interval=interval)
     rows = []
     for record in universe_df.to_dict(orient="records"):
         row = _snapshot_stock_row(record)
@@ -1797,12 +1765,11 @@ def _sector_analytics_stock_rows(
     ma_filter: dict[str, Any],
     rs_cutoff: float,
     near_high_pct: float,
-    force_refresh_prices: bool,
 ) -> list[dict[str, Any]]:
     ticker_meta = _ticker_metadata()
     rows = []
     for ticker in definition["stocks"]:
-        metrics = _price_metrics(get_price_history(ticker, period=period, interval=interval, force_refresh=force_refresh_prices))
+        metrics = _price_metrics(get_price_history(ticker, period=period, interval=interval))
         if not metrics:
             continue
         industry_meta = _sector_stock_industry_meta(ticker, sector_id, definition, ticker_meta)
@@ -2447,11 +2414,10 @@ def _industry_stock_metrics(
     interval: str,
     weighting: str,
     include_fundamentals: bool,
-    force_refresh_prices: bool,
 ) -> list[dict[str, Any]]:
     rows = []
     for ticker in tickers:
-        metrics = _price_metrics(get_price_history(ticker, period=period, interval=interval, force_refresh=force_refresh_prices))
+        metrics = _price_metrics(get_price_history(ticker, period=period, interval=interval))
         if not metrics:
             continue
         market_cap = None
@@ -2616,7 +2582,6 @@ def _universe_stock_rows(
     period: str,
     interval: str,
     max_stocks: int | None = None,
-    force_refresh_prices: bool = True,
 ) -> list[dict[str, Any]]:
     ticker_meta = _ticker_metadata()
     tickers = list(ticker_meta)
@@ -2624,7 +2589,7 @@ def _universe_stock_rows(
         tickers = tickers[: max(0, int(max_stocks))]
     rows = []
     for ticker in tickers:
-        metrics = _price_metrics(get_price_history(ticker, period=period, interval=interval, force_refresh=force_refresh_prices))
+        metrics = _price_metrics(get_price_history(ticker, period=period, interval=interval))
         if not metrics:
             continue
         rows.append({"ticker": ticker, **ticker_meta[ticker], **metrics})
@@ -2730,12 +2695,12 @@ def _normalize_rrg_zones(zone: list[str] | str | None) -> set[str]:
     return zones
 
 
-def _rrg_price_history(definition: dict[str, Any], *, period: str, interval: str, force_refresh_prices: bool = True) -> pd.DataFrame:
+def _rrg_price_history(definition: dict[str, Any], *, period: str, interval: str) -> pd.DataFrame:
     prices = _get_index_price_history(definition, period=period, interval=interval)
     if len(_rrg_close_series(prices)) > RRG_MIN_HISTORY_POINTS:
         prices.attrs["rrg_price_method"] = "index_ticker"
         return prices
-    proxy = _rrg_equal_weight_proxy(definition.get("stocks", ()), period=period, interval=interval, force_refresh_prices=force_refresh_prices)
+    proxy = _rrg_equal_weight_proxy(definition.get("stocks", ()), period=period, interval=interval)
     if not proxy.empty:
         proxy.attrs["selected_ticker"] = "equal_weight_proxy"
         proxy.attrs["rrg_price_method"] = "equal_weight_proxy"
@@ -2748,12 +2713,11 @@ def _rrg_benchmark_price_history(
     *,
     period: str,
     interval: str,
-    force_refresh_prices: bool = True,
 ) -> pd.DataFrame:
     prices = get_nse_index_price_history(benchmark_name, period=period, interval=interval)
     if not prices.empty:
         return prices
-    return get_price_history(benchmark_ticker, period=period, interval=interval, force_refresh=force_refresh_prices)
+    return get_price_history(benchmark_ticker, period=period, interval=interval)
 
 
 def _rrg_equal_weight_proxy(
@@ -2761,11 +2725,10 @@ def _rrg_equal_weight_proxy(
     *,
     period: str,
     interval: str,
-    force_refresh_prices: bool = True,
 ) -> pd.DataFrame:
     series = []
     for ticker in tickers:
-        close = _rrg_close_series(get_price_history(ticker, period=period, interval=interval, force_refresh=force_refresh_prices))
+        close = _rrg_close_series(get_price_history(ticker, period=period, interval=interval))
         if len(close) <= RRG_MIN_HISTORY_POINTS:
             continue
         first = _number(close.iloc[0], None)
