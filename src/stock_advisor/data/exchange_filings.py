@@ -9,7 +9,7 @@ from typing import Any
 import requests
 
 from stock_advisor.analysis.pipeline import sanitize_for_json
-from stock_advisor.data.universe import load_stock_universe
+from stock_advisor.data.market_data import lookup_instrument_identity
 
 logger = logging.getLogger(__name__)
 
@@ -214,31 +214,13 @@ def _get_bse_announcements(security_id: str, *, limit: int, days: int) -> tuple[
 
 def _exchange_identifiers(ticker: str) -> dict[str, Any]:
     try:
-        universe = load_stock_universe(universe="all_india")
+        identity = lookup_instrument_identity(ticker)
     except Exception as exc:  # noqa: BLE001
-        logger.info("All India universe load failed for exchange identifiers: %s", exc)
-        universe = None
-    if universe is None or universe.empty:
+        logger.info("instrument_master identity lookup failed for %s: %s", ticker, exc)
+        identity = None
+    if not identity:
         return {}
-
-    symbol = _symbol(ticker)
-    candidates = universe[
-        (universe.get("ticker").astype(str).str.upper() == ticker)
-        | (universe.get("nse_ticker").astype(str).str.upper() == ticker)
-        | (universe.get("bse_ticker").astype(str).str.upper() == ticker)
-        | (universe.get("symbol").astype(str).str.upper() == symbol)
-    ].copy()
-    if candidates.empty:
-        return {}
-    row = candidates.iloc[0].to_dict()
-    return {
-        "isin": _clean_identifier(row.get("isin")),
-        "nse_ticker": _clean_identifier(row.get("nse_ticker")),
-        "bse_ticker": _clean_identifier(row.get("bse_ticker")),
-        "nse_security_id": _clean_identifier(row.get("nse_security_id")),
-        "bse_security_id": _clean_identifier(row.get("bse_security_id") or row.get("security_id")),
-        "company_name": _clean_identifier(row.get("name")),
-    }
+    return {key: _clean_identifier(value) for key, value in identity.items()}
 
 
 def _extract_pdf_text(url: str, *, max_chars: int) -> tuple[str | None, str | None]:

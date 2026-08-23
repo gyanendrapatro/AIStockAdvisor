@@ -52,6 +52,7 @@ from stock_advisor.data.market_data import (
     get_basic_fundamentals as _get_basic_fundamentals,
     get_price_cache_status as _get_price_cache_status,
     get_price_history as _get_price_history,
+    list_instrument_master_tickers as _list_instrument_master_tickers,
     refresh_latest_exchange_eod_cache as _refresh_latest_exchange_eod_cache,
     warm_price_history_cache as _warm_price_history_cache,
 )
@@ -65,7 +66,6 @@ from stock_advisor.data.theme_discovery import discover_market_themes as _discov
 from stock_advisor.data.universe import (
     list_sector_constituents as _list_sector_constituents,
     list_stock_universe as _list_stock_universe,
-    load_stock_universe as _load_stock_universe,
     refresh_bse_stock_universe as _refresh_bse_stock_universe,
     refresh_full_stock_universe as _refresh_full_stock_universe,
     refresh_india_stock_universe as _refresh_india_stock_universe,
@@ -504,11 +504,12 @@ def refresh_latest_exchange_eod_cache(
     interval: str = "1d",
 ) -> dict[str, Any]:
     """Fetch latest official NSE/BSE bhavcopy rows and store them in the local SQLite cache."""
-    universe_df = _load_stock_universe(universe=universe, max_stocks=max_universe_stocks)
-    tickers = list(universe_df["ticker"]) if not universe_df.empty else []
+    tickers = _list_instrument_master_tickers(universe)
+    if max_universe_stocks is not None and max_universe_stocks > 0:
+        tickers = tickers[:max_universe_stocks]
     result = _refresh_latest_exchange_eod_cache(tickers, interval=interval)
     result["universe"] = universe
-    result["universe_stock_count"] = int(len(universe_df))
+    result["universe_stock_count"] = len(tickers)
     return sanitize_for_json(result)
 
 
@@ -559,8 +560,9 @@ def get_price_cache_status(
     max_universe_stocks: int | None = None,
 ) -> dict[str, Any]:
     """Return SQLite OHLCV cache coverage for the selected stock universe."""
-    universe_df = _load_stock_universe(universe=universe, max_stocks=max_universe_stocks)
-    tickers = list(universe_df["ticker"]) if not universe_df.empty else []
+    tickers = _list_instrument_master_tickers(universe)
+    if max_universe_stocks is not None and max_universe_stocks > 0:
+        tickers = tickers[:max_universe_stocks]
     return sanitize_for_json(_get_price_cache_status(tickers=tickers, interval=interval))
 
 
@@ -574,8 +576,9 @@ def warm_price_history_cache(
     force_refresh_prices: bool = True,
 ) -> dict[str, Any]:
     """Fetch and store OHLCV candles for a universe so later analytics avoid repeated provider downloads."""
-    universe_df = _load_stock_universe(universe=universe, max_stocks=max_universe_stocks)
-    tickers = list(universe_df["ticker"]) if not universe_df.empty else []
+    tickers = _list_instrument_master_tickers(universe)
+    if max_universe_stocks is not None and max_universe_stocks > 0:
+        tickers = tickers[:max_universe_stocks]
     result = _warm_price_history_cache(
         tickers,
         period=period,
@@ -584,7 +587,7 @@ def warm_price_history_cache(
         force_refresh=force_refresh_prices,
     )
     result["universe"] = universe
-    result["universe_stock_count"] = int(len(universe_df))
+    result["universe_stock_count"] = len(tickers)
     return sanitize_for_json(result)
 
 

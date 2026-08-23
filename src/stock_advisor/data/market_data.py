@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time, timedelta
 import logging
 import os
@@ -16,7 +17,15 @@ from stock_advisor.data.exchange_eod import get_latest_exchange_eod_rows
 from stock_advisor.data.sec_edgar import get_sec_fundamentals
 from stock_advisor.data.ownership import get_ownership_fundamentals
 from stock_advisor.data.stooq import get_stooq_price_history
-from stock_advisor.data.universe import UNIVERSE_COLUMNS, build_stock_master_frame
+from stock_advisor.data.universe import (
+    UNIVERSE_COLUMNS,
+    build_stock_master_frame,
+    load_stock_universe,
+    refresh_bse_stock_universe,
+    refresh_full_stock_universe,
+    refresh_india_stock_universe,
+    refresh_stock_universe,
+)
 from stock_advisor.data.yahoo_chart import get_yahoo_chart_price_history
 
 logger = logging.getLogger(__name__)
@@ -227,6 +236,9 @@ def _store_price_history(ticker: str, period: str, interval: str, df: pd.DataFra
         if column not in cache_df.columns:
             cache_df[column] = None
         cache_df[column] = pd.to_numeric(cache_df[column], errors="coerce")
+    has_turnover = "turnover" in cache_df.columns
+    if has_turnover:
+        cache_df["turnover"] = pd.to_numeric(cache_df["turnover"], errors="coerce")
     cache_df = cache_df.dropna(subset=["date", "open", "high", "low", "close"])
     if cache_df.empty:
         return
@@ -284,8 +296,85 @@ def _store_price_history(ticker: str, period: str, interval: str, df: pd.DataFra
                 """,
                 (ticker_id, interval, max_period_days, latest_date, provider, fetched_at, int(row_count or 0)),
             )
+
+            latest_row = next(row for row in rows if row[1] == latest_date)
+            latest_turnover = None
+            if has_turnover:
+                match = cache_df.loc[cache_df["date"] == latest_date, "turnover"]
+                if not match.empty and pd.notna(match.iloc[-1]):
+                    latest_turnover = float(match.iloc[-1])
+            conn.execute(
+                """
+                INSERT INTO price_data (ticker_id, date, open, high, low, close, volume, turnover, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker_id) DO UPDATE SET
+                    date=excluded.date, open=excluded.open, high=excluded.high, low=excluded.low,
+                    close=excluded.close, volume=excluded.volume,
+                    turnover=COALESCE(excluded.turnover, price_data.turnover),
+                    fetched_at=excluded.fetched_at
+                WHERE excluded.date >= COALESCE(price_data.date, '')
+                """,
+                (
+                    ticker_id, latest_row[1], latest_row[2], latest_row[3], latest_row[4], latest_row[5],
+                    latest_row[6], latest_turnover, fetched_at,
+                ),
+            )
+
+            if interval == "1d":
+                _refresh_live_metrics(conn, ticker_id, interval, latest_date, float(latest_row[5]))
     except Exception as exc:  # noqa: BLE001
         logger.debug("Price cache store failed for %s: %s", ticker_key, exc)
+
+
+def _refresh_live_metrics(conn: sqlite3.Connection, ticker_id: int, interval: str, latest_date: str, last_price: float) -> None:
+    """Recompute year_high/year_low/near_52w_high_pct/return_30d_pct/return_365d_pct for a
+    ticker from price_history_cache (which already has whatever was just written, plus any
+    older history) and upsert into live_metrics. Cheap: a handful of indexed range queries."""
+    window = conn.execute(
+        """
+        SELECT MAX(high) AS year_high, MIN(low) AS year_low
+        FROM price_history_cache
+        WHERE ticker_id = ? AND interval = ? AND date >= date(?, '-370 days')
+        """,
+        (ticker_id, interval, latest_date),
+    ).fetchone()
+    year_high = float(window["year_high"]) if window and window["year_high"] is not None else None
+    year_low = float(window["year_low"]) if window and window["year_low"] is not None else None
+    near_52w_high_pct = (
+        round(100 * (year_high - last_price) / year_high, 4) if year_high else None
+    )
+
+    def _return_pct(days: int) -> float | None:
+        prior = conn.execute(
+            """
+            SELECT close FROM price_history_cache
+            WHERE ticker_id = ? AND interval = ? AND date <= date(?, ?)
+            ORDER BY date DESC LIMIT 1
+            """,
+            (ticker_id, interval, latest_date, f"-{days} days"),
+        ).fetchone()
+        if not prior or not prior["close"]:
+            return None
+        prior_close = float(prior["close"])
+        if prior_close == 0:
+            return None
+        return round(100 * (last_price - prior_close) / prior_close, 4)
+
+    return_30d_pct = _return_pct(30)
+    return_365d_pct = _return_pct(365)
+    computed_at = _current_market_datetime().isoformat()
+    conn.execute(
+        """
+        INSERT INTO live_metrics (ticker_id, last_price, year_high, year_low, near_52w_high_pct, return_30d_pct, return_365d_pct, as_of_date, computed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(ticker_id) DO UPDATE SET
+            last_price=excluded.last_price, year_high=excluded.year_high, year_low=excluded.year_low,
+            near_52w_high_pct=excluded.near_52w_high_pct, return_30d_pct=excluded.return_30d_pct,
+            return_365d_pct=excluded.return_365d_pct, as_of_date=excluded.as_of_date, computed_at=excluded.computed_at
+        WHERE excluded.as_of_date >= COALESCE(live_metrics.as_of_date, '')
+        """,
+        (ticker_id, last_price, year_high, year_low, near_52w_high_pct, return_30d_pct, return_365d_pct, latest_date, computed_at),
+    )
 
 
 def _overlay_exchange_latest_rows(frames: dict[str, pd.DataFrame], *, period: str, interval: str) -> dict[str, pd.DataFrame]:
@@ -369,38 +458,85 @@ def _price_cache_connection() -> sqlite3.Connection:
 
 
 def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
+    _migrate_stock_list_table_rename(conn)
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS stock_list (
+        CREATE TABLE IF NOT EXISTS instrument_master (
             ticker_id INTEGER PRIMARY KEY AUTOINCREMENT,
             ticker TEXT NOT NULL UNIQUE,
             market TEXT NOT NULL,
             symbol TEXT,
             name TEXT,
             isin TEXT,
-            sector TEXT,
-            industry TEXT,
-            basic_industry TEXT,
-            index_name TEXT,
             source TEXT,
             active INTEGER,
             series TEXT,
-            free_float_market_cap REAL,
-            last_price REAL,
-            year_high REAL,
-            year_low REAL,
-            near_52w_high_pct REAL,
-            return_30d_pct REAL,
-            return_365d_pct REAL,
-            refreshed_at TEXT,
             exchange TEXT,
             security_id TEXT,
             nse_ticker TEXT,
             bse_ticker TEXT,
             nse_security_id TEXT,
             bse_security_id TEXT,
+            in_nifty_total_market INTEGER NOT NULL DEFAULT 0,
+            synced_at TEXT
+        )
+        """
+    )
+    _migrate_instrument_master_columns(conn)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_instrument_master_isin_unique ON instrument_master(isin)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS security_classification (
+            ticker_id INTEGER PRIMARY KEY REFERENCES instrument_master(ticker_id),
+            sector TEXT,
+            industry TEXT,
+            basic_industry TEXT,
+            index_name TEXT,
+            classification_source TEXT,
             data_quality TEXT,
-            classification_source TEXT
+            synced_at TEXT
+        )
+        """
+    )
+    _migrate_security_classification_split(conn)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_data (
+            ticker_id INTEGER PRIMARY KEY REFERENCES instrument_master(ticker_id),
+            date TEXT,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            volume REAL,
+            turnover REAL,
+            fetched_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS market_cap (
+            ticker_id INTEGER PRIMARY KEY REFERENCES instrument_master(ticker_id),
+            market_cap REAL,
+            free_float_market_cap REAL,
+            date TEXT,
+            fetched_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS live_metrics (
+            ticker_id INTEGER PRIMARY KEY REFERENCES instrument_master(ticker_id),
+            last_price REAL,
+            year_high REAL,
+            year_low REAL,
+            near_52w_high_pct REAL,
+            return_30d_pct REAL,
+            return_365d_pct REAL,
+            as_of_date TEXT,
+            computed_at TEXT
         )
         """
     )
@@ -408,7 +544,7 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS price_history_cache (
-            ticker_id INTEGER NOT NULL REFERENCES stock_list(ticker_id),
+            ticker_id INTEGER NOT NULL REFERENCES instrument_master(ticker_id),
             interval TEXT NOT NULL,
             date TEXT NOT NULL,
             open REAL,
@@ -425,7 +561,7 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS price_cache_meta (
-            ticker_id INTEGER NOT NULL REFERENCES stock_list(ticker_id),
+            ticker_id INTEGER NOT NULL REFERENCES instrument_master(ticker_id),
             interval TEXT NOT NULL,
             max_period_days INTEGER NOT NULL,
             latest_date TEXT,
@@ -437,6 +573,62 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_price_history_cache_lookup ON price_history_cache (ticker_id, interval, date)")
+
+
+def _migrate_stock_list_table_rename(conn: sqlite3.Connection) -> None:
+    """One-time rename: stock_list -> instrument_master (clearer name for the security-identity
+    table post schema-split). No-ops if already renamed or on a fresh install."""
+    tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "stock_list" in tables and "instrument_master" not in tables:
+        conn.execute("ALTER TABLE stock_list RENAME TO instrument_master")
+        conn.commit()
+
+
+def _migrate_instrument_master_columns(conn: sqlite3.Connection) -> None:
+    """Drop instrument_master's live-metric columns (they're fact/time-varying data that belongs
+    in price_data/market_cap/live_metrics, not the security-master/dimension table) and add
+    synced_at. No-ops once already migrated. Cheap: none of these columns are indexed/constrained,
+    so SQLite's ALTER TABLE ... DROP COLUMN is a metadata-only change here, not a full rewrite.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(instrument_master)")}
+    if not cols:
+        return  # table doesn't exist yet (handled by the CREATE TABLE IF NOT EXISTS above)
+    metric_cols = [
+        "free_float_market_cap", "last_price", "year_high", "year_low",
+        "near_52w_high_pct", "return_30d_pct", "return_365d_pct", "refreshed_at",
+    ]
+    for column in metric_cols:
+        if column in cols:
+            conn.execute(f"ALTER TABLE instrument_master DROP COLUMN {column}")
+    if "synced_at" not in cols:
+        conn.execute("ALTER TABLE instrument_master ADD COLUMN synced_at TEXT")
+    if "in_nifty_total_market" not in cols:
+        conn.execute("ALTER TABLE instrument_master ADD COLUMN in_nifty_total_market INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+
+
+def _migrate_security_classification_split(conn: sqlite3.Connection) -> None:
+    """Move sector/industry/basic_industry/index_name/classification_source/data_quality out of
+    instrument_master into their own security_classification table (keyed by ticker_id). One-time,
+    idempotent — backfills security_classification from any existing instrument_master data before
+    dropping the columns, so nothing is lost.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(instrument_master)")}
+    classification_cols = ["sector", "industry", "basic_industry", "index_name", "classification_source", "data_quality"]
+    if not any(c in cols for c in classification_cols):
+        return  # already migrated, or fresh install
+    conn.execute(
+        """
+        INSERT INTO security_classification (ticker_id, sector, industry, basic_industry, index_name, classification_source, data_quality, synced_at)
+        SELECT ticker_id, sector, industry, basic_industry, index_name, classification_source, data_quality, synced_at
+        FROM instrument_master
+        WHERE ticker_id NOT IN (SELECT ticker_id FROM security_classification)
+        """
+    )
+    for column in classification_cols:
+        if column in cols:
+            conn.execute(f"ALTER TABLE instrument_master DROP COLUMN {column}")
+    conn.commit()
 
 
 def _migrate_legacy_ticker_schema(conn: sqlite3.Connection) -> None:
@@ -461,14 +653,14 @@ def _migrate_legacy_ticker_schema(conn: sqlite3.Connection) -> None:
 
     conn.execute(
         """
-        INSERT OR IGNORE INTO stock_list (ticker, market)
+        INSERT OR IGNORE INTO instrument_master (ticker, market)
         SELECT DISTINCT ticker, CASE WHEN ticker LIKE '%.NS' OR ticker LIKE '%.BO' THEN 'IN' ELSE 'US' END
         FROM price_cache_meta_legacy
         """
     )
     conn.execute(
         """
-        INSERT OR IGNORE INTO stock_list (ticker, market)
+        INSERT OR IGNORE INTO instrument_master (ticker, market)
         SELECT DISTINCT ticker, CASE WHEN ticker LIKE '%.NS' OR ticker LIKE '%.BO' THEN 'IN' ELSE 'US' END
         FROM price_history_cache_legacy
         """
@@ -477,7 +669,7 @@ def _migrate_legacy_ticker_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS price_cache_meta (
-            ticker_id INTEGER NOT NULL REFERENCES stock_list(ticker_id),
+            ticker_id INTEGER NOT NULL REFERENCES instrument_master(ticker_id),
             interval TEXT NOT NULL, max_period_days INTEGER NOT NULL, latest_date TEXT,
             provider TEXT, fetched_at TEXT NOT NULL, row_count INTEGER NOT NULL,
             PRIMARY KEY (ticker_id, interval)
@@ -488,14 +680,14 @@ def _migrate_legacy_ticker_schema(conn: sqlite3.Connection) -> None:
         """
         INSERT OR IGNORE INTO price_cache_meta (ticker_id, interval, max_period_days, latest_date, provider, fetched_at, row_count)
         SELECT sl.ticker_id, m.interval, m.max_period_days, m.latest_date, m.provider, m.fetched_at, m.row_count
-        FROM price_cache_meta_legacy m JOIN stock_list sl ON sl.ticker = m.ticker
+        FROM price_cache_meta_legacy m JOIN instrument_master sl ON sl.ticker = m.ticker
         """
     )
 
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS price_history_cache (
-            ticker_id INTEGER NOT NULL REFERENCES stock_list(ticker_id),
+            ticker_id INTEGER NOT NULL REFERENCES instrument_master(ticker_id),
             interval TEXT NOT NULL, date TEXT NOT NULL,
             open REAL, high REAL, low REAL, close REAL, volume REAL,
             provider TEXT, fetched_at TEXT NOT NULL,
@@ -507,7 +699,7 @@ def _migrate_legacy_ticker_schema(conn: sqlite3.Connection) -> None:
         """
         INSERT OR IGNORE INTO price_history_cache (ticker_id, interval, date, open, high, low, close, volume, provider, fetched_at)
         SELECT sl.ticker_id, h.interval, h.date, h.open, h.high, h.low, h.close, h.volume, h.provider, h.fetched_at
-        FROM price_history_cache_legacy h JOIN stock_list sl ON sl.ticker = h.ticker
+        FROM price_history_cache_legacy h JOIN instrument_master sl ON sl.ticker = h.ticker
         """
     )
 
@@ -517,54 +709,317 @@ def _migrate_legacy_ticker_schema(conn: sqlite3.Connection) -> None:
     logger.info("Legacy price cache migration complete.")
 
     try:
-        sync_stock_list_master()
+        sync_instrument_master()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("stock_list enrichment sync after migration failed: %s", exc)
+        logger.warning("instrument_master enrichment sync after migration failed: %s", exc)
 
 
 def _ticker_id(conn: sqlite3.Connection, ticker_key: str, *, create: bool = False) -> int | None:
-    row = conn.execute("SELECT ticker_id FROM stock_list WHERE ticker = ?", (ticker_key,)).fetchone()
+    row = conn.execute("SELECT ticker_id FROM instrument_master WHERE ticker = ?", (ticker_key,)).fetchone()
     if row:
         return int(row["ticker_id"])
     if not create:
         return None
     conn.execute(
-        "INSERT OR IGNORE INTO stock_list (ticker, market) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO instrument_master (ticker, market) VALUES (?, ?)",
         (ticker_key, _infer_market(ticker_key)),
     )
-    row = conn.execute("SELECT ticker_id FROM stock_list WHERE ticker = ?", (ticker_key,)).fetchone()
+    row = conn.execute("SELECT ticker_id FROM instrument_master WHERE ticker = ?", (ticker_key,)).fetchone()
     return int(row["ticker_id"]) if row else None
 
 
-def sync_stock_list_master(universes: list[str] | None = None) -> dict[str, Any]:
-    """Consolidate data/*.csv NSE/BSE universes into stock_list (insert new, refresh existing)."""
+def _bulk_ticker_ids(conn: sqlite3.Connection, tickers: list[str]) -> dict[str, int]:
+    """Resolve many ticker strings to ticker_id in one pass (chunked under SQLite's ~999-variable
+    per-statement limit). Only returns tickers that already have an instrument_master row —
+    callers that need lazy-create semantics should use _ticker_id(..., create=True) instead."""
+    unique = list(dict.fromkeys(t for t in tickers if t))
+    if not unique:
+        return {}
+    result: dict[str, int] = {}
+    chunk_size = 500
+    for start in range(0, len(unique), chunk_size):
+        chunk = unique[start : start + chunk_size]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT ticker, ticker_id FROM instrument_master WHERE ticker IN ({placeholders})", chunk
+        ).fetchall()
+        result.update({row["ticker"]: row["ticker_id"] for row in rows})
+    return result
+
+
+_INSTRUMENT_MASTER_IDENTITY_COLUMNS = [
+    "symbol", "name", "isin", "source", "active", "series",
+    "exchange", "security_id", "nse_ticker", "bse_ticker", "nse_security_id", "bse_security_id",
+]
+_SECURITY_CLASSIFICATION_COLUMNS = [
+    "sector", "industry", "basic_industry", "index_name", "classification_source", "data_quality",
+]
+
+
+def sync_instrument_master(universes: list[str] | None = None) -> dict[str, Any]:
+    """Consolidate data/*.csv NSE/BSE universes into instrument_master + security_classification
+    + market_cap (insert new, refresh existing).
+
+    instrument_master only gets identity columns (plus market/synced_at) — it's a pure
+    security-master/dimension table. Classification lives in security_classification;
+    free_float_market_cap (the only metric the broad universe CSV provides) lives in market_cap.
+    NIFTY Total Market membership is tagged as its own flag, independent of the ISIN-precedence
+    identity backfill, so 'broad' universe membership stays reconstructable from the DB even
+    after ISIN dedup.
+    """
     frame = build_stock_master_frame(universes=universes)
     universes_used = list(universes) if universes else None
     if frame.empty:
         return {"synced_ticker_count": 0, "universes": universes_used}
-    columns = ["market"] + [c for c in UNIVERSE_COLUMNS if c != "ticker"]
-    placeholders = ", ".join(["?"] * (len(columns) + 1))
-    update_clause = ", ".join(f"{c}=excluded.{c}" for c in columns)
-    rows = [
+
+    synced_at = _current_market_datetime().isoformat()
+    identity_columns = ["market", "synced_at"] + _INSTRUMENT_MASTER_IDENTITY_COLUMNS
+    placeholders = ", ".join(["?"] * (len(identity_columns) + 1))
+    # isin is deliberately excluded from the UPDATE branch: it's only ever set on a fresh INSERT
+    # (guarded by ON CONFLICT(isin) DO NOTHING below). Letting an UPDATE on an already-known
+    # ticker touch isin risks a *second*, independent UNIQUE-constraint violation against some
+    # other existing row — a real failure mode, not just a theoretical one (hit on the very first
+    # full sync run against live data).
+    update_clause = ", ".join(f"{c}=excluded.{c}" for c in identity_columns if c != "isin")
+    records = frame.to_dict("records")
+    identity_rows = [
         (
             record.get("ticker"),
             _infer_market(record.get("ticker")),
-            *(record.get(c) for c in columns if c != "market"),
+            synced_at,
+            *(record.get(c) for c in _INSTRUMENT_MASTER_IDENTITY_COLUMNS),
         )
-        for record in frame.to_dict("records")
+        for record in records
     ]
+
     with _price_cache_connection() as conn:
         _ensure_price_cache_schema(conn)
         conn.executemany(
             f"""
-            INSERT INTO stock_list (ticker, {", ".join(columns)})
+            INSERT INTO instrument_master (ticker, {", ".join(identity_columns)})
             VALUES ({placeholders})
             ON CONFLICT(ticker) DO UPDATE SET {update_clause}
+            ON CONFLICT(isin) DO NOTHING
             """,
-            rows,
+            identity_rows,
         )
         conn.commit()
-    return {"synced_ticker_count": len(rows), "universes": universes_used}
+
+        ticker_id_map = _bulk_ticker_ids(conn, [record.get("ticker") for record in records])
+
+        classification_rows = [
+            (ticker_id_map[record["ticker"]], synced_at, *(record.get(c) for c in _SECURITY_CLASSIFICATION_COLUMNS))
+            for record in records
+            if record.get("ticker") in ticker_id_map
+        ]
+        if classification_rows:
+            classification_update = ", ".join(f"{c}=excluded.{c}" for c in [*_SECURITY_CLASSIFICATION_COLUMNS, "synced_at"])
+            conn.executemany(
+                f"""
+                INSERT INTO security_classification (ticker_id, synced_at, {", ".join(_SECURITY_CLASSIFICATION_COLUMNS)})
+                VALUES (?, ?, {", ".join("?" for _ in _SECURITY_CLASSIFICATION_COLUMNS)})
+                ON CONFLICT(ticker_id) DO UPDATE SET {classification_update}
+                """,
+                classification_rows,
+            )
+            conn.commit()
+
+        # NIFTY Total Market membership + free_float_market_cap: loaded fresh here (not reused
+        # from `frame`), so this stays correct even for a partial single-universe sync that
+        # didn't include "broad" in `universes`.
+        broad_frame = load_stock_universe(universe="broad")
+        if not broad_frame.empty:
+            broad_records = broad_frame.to_dict("records")
+            broad_ticker_id_map = _bulk_ticker_ids(conn, [r.get("ticker") for r in broad_records])
+            broad_ids = list(broad_ticker_id_map.values())
+            if broad_ids:
+                conn.executemany(
+                    "UPDATE instrument_master SET in_nifty_total_market = 1 WHERE ticker_id = ?",
+                    [(tid,) for tid in broad_ids],
+                )
+                market_cap_rows = [
+                    (broad_ticker_id_map[r["ticker"]], r.get("free_float_market_cap"), r.get("refreshed_at"), synced_at)
+                    for r in broad_records
+                    if r.get("ticker") in broad_ticker_id_map
+                ]
+                conn.executemany(
+                    """
+                    INSERT INTO market_cap (ticker_id, free_float_market_cap, date, fetched_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(ticker_id) DO UPDATE SET
+                        free_float_market_cap=excluded.free_float_market_cap,
+                        date=excluded.date,
+                        fetched_at=excluded.fetched_at
+                    """,
+                    market_cap_rows,
+                )
+                conn.commit()
+
+    return {"synced_ticker_count": len(identity_rows), "universes": universes_used}
+
+
+def list_instrument_master_tickers(universe: str) -> list[str]:
+    """Return tickers from instrument_master for an exchange-derivable universe ('full_nse',
+    'full_bse', 'all_india') or 'broad' (via the in_nifty_total_market flag)."""
+    normalized = str(universe or "").strip().lower()
+    if normalized in {"broad", "nse_total_market", "nifty_total_market", "total_market"}:
+        where = "in_nifty_total_market = 1"
+    elif normalized in {"full_nse", "nse_full", "nse_equity"}:
+        where = "market = 'IN' AND exchange IN ('NSE', 'NSE+BSE')"
+    elif normalized in {"full_bse", "bse_full", "bse_equity"}:
+        where = "market = 'IN' AND exchange IN ('BSE', 'NSE+BSE')"
+    else:  # all_india and aliases
+        where = "market = 'IN'"
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        rows = conn.execute(f"SELECT ticker FROM instrument_master WHERE {where}").fetchall()
+    return [row["ticker"] for row in rows]
+
+
+def lookup_instrument_identity(ticker: str) -> dict[str, Any] | None:
+    """Single-ticker identity lookup against instrument_master — matches on ticker, nse_ticker,
+    bse_ticker, or symbol (whichever the caller happens to have). Returns isin/nse_ticker/
+    bse_ticker/security ids/name, or None if the ticker isn't in instrument_master at all."""
+    ticker_key = _cache_ticker(ticker)
+    symbol = ticker_key.split(".", 1)[0]
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        row = conn.execute(
+            """
+            SELECT isin, nse_ticker, bse_ticker, nse_security_id, bse_security_id, security_id, name
+            FROM instrument_master
+            WHERE ticker = ? OR nse_ticker = ? OR bse_ticker = ? OR symbol = ?
+            LIMIT 1
+            """,
+            (ticker_key, ticker_key, ticker_key, symbol),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "isin": row["isin"],
+        "nse_ticker": row["nse_ticker"],
+        "bse_ticker": row["bse_ticker"],
+        "nse_security_id": row["nse_security_id"],
+        "bse_security_id": row["bse_security_id"] or row["security_id"],
+        "company_name": row["name"],
+    }
+
+
+def backfill_market_cap_from_yfinance(tickers: list[str] | None = None, *, max_workers: int = 8) -> dict[str, Any]:
+    """Fetch yfinance marketCap for the given tickers (default: every instrument_master ticker)
+    and upsert into market_cap.market_cap. Real per-ticker network cost (one call per ticker) —
+    call explicitly; not part of any automatic sync."""
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        if tickers is None:
+            tickers = [row["ticker"] for row in conn.execute("SELECT ticker FROM instrument_master")]
+        ticker_id_map = _bulk_ticker_ids(conn, tickers)
+
+    if not ticker_id_map:
+        return {"requested_ticker_count": 0, "updated_ticker_count": 0, "missing_ticker_count": 0}
+
+    def _fetch_one(ticker: str) -> tuple[str, float | None]:
+        try:
+            info = yf.Ticker(ticker).info or {}
+        except Exception:  # noqa: BLE001
+            return ticker, None
+        value = info.get("marketCap")
+        return ticker, (float(value) if isinstance(value, (int, float)) else None)
+
+    results: dict[str, float | None] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(ticker_id_map)))) as executor:
+        futures = [executor.submit(_fetch_one, ticker) for ticker in ticker_id_map]
+        for future in as_completed(futures):
+            ticker, market_cap = future.result()
+            results[ticker] = market_cap
+
+    fetched_at = _current_market_datetime().isoformat()
+    rows_to_write = [
+        (ticker_id_map[ticker], market_cap, fetched_at, fetched_at)
+        for ticker, market_cap in results.items()
+        if market_cap is not None
+    ]
+    with _price_cache_connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO market_cap (ticker_id, market_cap, date, fetched_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(ticker_id) DO UPDATE SET market_cap=excluded.market_cap, date=excluded.date, fetched_at=excluded.fetched_at
+            """,
+            rows_to_write,
+        )
+        conn.commit()
+    return {
+        "requested_ticker_count": len(ticker_id_map),
+        "updated_ticker_count": len(rows_to_write),
+        "missing_ticker_count": len(ticker_id_map) - len(rows_to_write),
+    }
+
+
+def load_stock_universe_from_db(
+    universe: str, *, refresh: bool = False, max_stocks: int | None = None
+) -> pd.DataFrame:
+    """DB-backed replacement for load_stock_universe() — same UNIVERSE_COLUMNS-shaped output,
+    sourced from instrument_master + security_classification + market_cap + live_metrics
+    instead of re-parsing a CSV. Supports 'broad' via the in_nifty_total_market flag, so every
+    universe type load_stock_universe() supports (except 'local', which never touched the CSVs
+    anyway) is reconstructable from the DB.
+
+    `refresh=True` mirrors load_stock_universe()'s own semantics: it triggers a live network
+    refresh of the underlying universe CSV first (via the same universe.py refresh_* functions),
+    which already self-syncs instrument_master/security_classification/market_cap afterward — so
+    the DB read below reflects the fresh data.
+    """
+    normalized = str(universe or "").strip().lower()
+    if refresh:
+        try:
+            if normalized in {"broad", "nse_total_market", "nifty_total_market", "total_market"}:
+                refresh_stock_universe()
+            elif normalized in {"full_nse", "nse_full", "nse_equity"}:
+                refresh_full_stock_universe(max_symbols=max_stocks)
+            elif normalized in {"full_bse", "bse_full", "bse_equity"}:
+                refresh_bse_stock_universe()
+            elif normalized in {"all_india", "india", "nse_bse", "bse_nse"}:
+                refresh_india_stock_universe()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Universe refresh before DB load failed for %s: %s", universe, exc)
+    if normalized in {"broad", "nse_total_market", "nifty_total_market", "total_market"}:
+        where = "im.in_nifty_total_market = 1"
+    elif normalized in {"full_nse", "nse_full", "nse_equity"}:
+        where = "im.market = 'IN' AND im.exchange IN ('NSE', 'NSE+BSE')"
+    elif normalized in {"full_bse", "bse_full", "bse_equity"}:
+        where = "im.market = 'IN' AND im.exchange IN ('BSE', 'NSE+BSE')"
+    elif normalized in {"all_india", "india", "nse_bse", "bse_nse"}:
+        where = "im.market = 'IN'"
+    else:  # "local" or unrecognized — never CSV/DB-backed
+        return pd.DataFrame(columns=UNIVERSE_COLUMNS)
+
+    query = f"""
+        SELECT
+            im.ticker, im.symbol, im.name, im.isin,
+            sc.sector, sc.industry, sc.basic_industry, sc.index_name,
+            im.source, im.active, im.series,
+            mc.free_float_market_cap,
+            lm.last_price, lm.year_high, lm.year_low, lm.near_52w_high_pct, lm.return_30d_pct, lm.return_365d_pct,
+            COALESCE(mc.fetched_at, lm.computed_at, im.synced_at) AS refreshed_at,
+            im.exchange, im.security_id, im.nse_ticker, im.bse_ticker, im.nse_security_id, im.bse_security_id,
+            sc.data_quality, sc.classification_source
+        FROM instrument_master im
+        LEFT JOIN security_classification sc ON sc.ticker_id = im.ticker_id
+        LEFT JOIN market_cap mc ON mc.ticker_id = im.ticker_id
+        LEFT JOIN live_metrics lm ON lm.ticker_id = im.ticker_id
+        WHERE {where}
+    """
+    if max_stocks is not None and max_stocks > 0:
+        query += f" LIMIT {int(max_stocks)}"
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        rows = conn.execute(query).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=UNIVERSE_COLUMNS)
+    df = pd.DataFrame([dict(row) for row in rows])
+    df["active"] = df["active"].map(lambda v: bool(v) if v is not None else None)
+    return df[UNIVERSE_COLUMNS]
 
 
 def _period_days(period: str) -> int | None:
@@ -603,9 +1058,12 @@ def _cache_ticker(ticker: str) -> str:
 
 
 def _infer_market(ticker: str) -> str:
-    """Classify a ticker as India ('IN', .NS/.BO suffix) or US ('US', everything else)."""
+    """Classify a ticker as India ('IN': .NS/.BO suffix, or a '^'-prefixed India index/sector
+    proxy like ^NSEI/^CNXIT used throughout this app) or US ('US', everything else)."""
     upper = str(ticker or "").strip().upper()
-    return "IN" if upper.endswith(".NS") or upper.endswith(".BO") else "US"
+    if upper.endswith(".NS") or upper.endswith(".BO") or upper.startswith("^"):
+        return "IN"
+    return "US"
 
 
 def _parse_cache_datetime(value: Any) -> datetime | None:
@@ -638,7 +1096,7 @@ def get_price_cache_status(tickers: list[str] | tuple[str, ...] | None = None, i
                 f"""
                 SELECT m.row_count, m.latest_date, m.fetched_at
                 FROM price_cache_meta m
-                JOIN stock_list sl ON sl.ticker_id = m.ticker_id
+                JOIN instrument_master sl ON sl.ticker_id = m.ticker_id
                 WHERE m.interval = ?{ticker_filter}
                 """,
                 params,

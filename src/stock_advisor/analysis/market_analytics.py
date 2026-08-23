@@ -20,9 +20,14 @@ from stock_advisor.analysis.sector_rotation import (
     _score_sector_stock,
     _score_trend,
 )
-from stock_advisor.data.market_data import get_basic_fundamentals, get_price_histories, get_price_history
+from stock_advisor.data.market_data import (
+    get_basic_fundamentals,
+    get_price_histories,
+    get_price_history,
+    load_stock_universe_from_db,
+)
 from stock_advisor.data.nse_indices import get_nse_index_price_history
-from stock_advisor.data.universe import list_universe_industry_definitions, load_stock_universe
+from stock_advisor.data.universe import list_universe_industry_definitions
 
 
 MIN_SECTOR_STOCKS_FOR_RANKING = 5
@@ -830,7 +835,7 @@ def _get_broad_sector_analytics(
     max_universe_stocks: int | None,
 ) -> dict[str, Any]:
     normalized_universe = _normalize_universe(universe)
-    universe_df = load_stock_universe(universe=universe, refresh=refresh_universe, max_stocks=max_universe_stocks)
+    universe_df = load_stock_universe_from_db(universe, refresh=refresh_universe, max_stocks=max_universe_stocks)
     if universe_df.empty:
         result = get_sector_analytics(
             mode=mode,
@@ -938,7 +943,7 @@ def _get_broad_industry_analytics(
     force_refresh_prices: bool,
     max_universe_stocks: int | None,
 ) -> dict[str, Any]:
-    universe_df = load_stock_universe(universe=universe, refresh=refresh_universe, max_stocks=max_universe_stocks)
+    universe_df = load_stock_universe_from_db(universe, refresh=refresh_universe, max_stocks=max_universe_stocks)
     if universe_df.empty:
         result = get_industry_analytics(
             period=period,
@@ -1085,7 +1090,7 @@ def _rank_broad_industry_stocks(
     refresh_universe: bool,
     force_refresh_prices: bool,
 ) -> dict[str, Any]:
-    universe_df = load_stock_universe(universe=universe, refresh=refresh_universe)
+    universe_df = load_stock_universe_from_db(universe, refresh=refresh_universe)
     industry_id, industry_df = _resolve_broad_industry(industry, universe_df)
     tickers = list(industry_df["ticker"])
     price_map = get_price_histories(tickers, period=period, interval=interval, force_refresh=force_refresh_prices)
@@ -1179,8 +1184,8 @@ def get_moving_average_crossover_scan(
         universe_refreshed_at = None
         universe_source = "Configured local industry baskets"
     else:
-        universe_df = load_stock_universe(
-            universe=normalized_universe,
+        universe_df = load_stock_universe_from_db(
+            normalized_universe,
             refresh=refresh_universe,
             max_stocks=max_universe_stocks,
         )
@@ -1312,8 +1317,8 @@ def get_top_gainers(
         universe_stock_count = len(source_rows)
         universe_source = "Configured local industry baskets"
     else:
-        universe_df = load_stock_universe(
-            universe=normalized_universe,
+        universe_df = load_stock_universe_from_db(
+            normalized_universe,
             refresh=refresh_universe,
             max_stocks=max_universe_stocks,
         )

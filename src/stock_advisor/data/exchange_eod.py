@@ -73,7 +73,7 @@ def get_exchange_eod_rows_for_date(tickers: list[str] | tuple[str, ...], trade_d
         frame.attrs["provider"] = row["provider"]
         frame.attrs["selected_ticker"] = ticker
         frame.attrs["exchange_trade_date"] = str(row["date"].date())
-        out[ticker] = frame[["date", "open", "high", "low", "close", "volume"]]
+        out[ticker] = frame[["date", "open", "high", "low", "close", "volume", "turnover"]]
         out[ticker].attrs.update(frame.attrs)
     return out
 
@@ -159,6 +159,7 @@ def _normalize_bhavcopy(raw: pd.DataFrame, *, provider: str) -> pd.DataFrame:
             "low": pd.to_numeric(raw["LwPric"], errors="coerce"),
             "close": pd.to_numeric(raw["ClsPric"], errors="coerce"),
             "volume": pd.to_numeric(raw.get("TtlTradgVol", pd.Series([None] * len(raw))), errors="coerce"),
+            "turnover": pd.to_numeric(raw.get("TtlTrfVal", pd.Series([None] * len(raw))), errors="coerce"),
             "provider": provider,
         }
     )

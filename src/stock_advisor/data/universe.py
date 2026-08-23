@@ -214,19 +214,6 @@ _STOCK_MASTER_UNIVERSES = ["broad", "all_india", "full_nse", "full_bse"]
 
 
 _STOCK_MASTER_IDENTITY_PRECEDENCE = ["all_india", "full_nse", "full_bse", "broad"]
-_STOCK_MASTER_LIVE_METRIC_COLUMNS = [
-    "sector",
-    "industry",
-    "basic_industry",
-    "index_name",
-    "free_float_market_cap",
-    "last_price",
-    "year_high",
-    "year_low",
-    "near_52w_high_pct",
-    "return_30d_pct",
-    "return_365d_pct",
-]
 
 
 def build_stock_master_frame(universes: list[str] | None = None) -> pd.DataFrame:
@@ -236,9 +223,16 @@ def build_stock_master_frame(universes: list[str] | None = None) -> pd.DataFrame
     security-id fields) come from whichever of ``all_india`` > ``full_nse`` > ``full_bse`` >
     ``broad`` has a row for that ticker first — ``all_india`` is the only source that actually
     cross-references NSE+BSE listings, so it must win over ``broad`` (NIFTY Total Market),
-    which never resolves cross-listing at all. ``broad``'s live quote/classification columns
-    (sector, market cap, price, returns, ...) are then overlaid on top for any ticker it covers,
-    since it's the only source with fresh market-metric data.
+    which never resolves cross-listing at all.
+
+    Deduped by ISIN (not raw ticker string) when present: the same company can appear under
+    different ticker strings across sources (e.g. "KSB.NS" in all_india/full_nse vs "500249.BO"
+    in full_bse for the identical company) — deduping on the ticker string alone produced a
+    near-blank duplicate row per dual-listed stock. Falls back to ticker when isin is
+    missing/blank so every row still gets its own group. Identity/cross-listing columns are
+    backfilled across each dedup group first, so the surviving row carries whatever
+    exchange/nse_ticker/bse_ticker info exists on ANY row sharing that ISIN, even if the
+    precedence-winning source itself didn't resolve it.
     """
     selected = universes or _STOCK_MASTER_UNIVERSES
     loaded = {universe: load_stock_universe(universe=universe) for universe in selected}
@@ -246,34 +240,33 @@ def build_stock_master_frame(universes: list[str] | None = None) -> pd.DataFrame
     identity_frames = [loaded[universe] for universe in _STOCK_MASTER_IDENTITY_PRECEDENCE if universe in loaded]
     if not identity_frames:
         return pd.DataFrame(columns=UNIVERSE_COLUMNS)
-    base = pd.concat(identity_frames, ignore_index=True).drop_duplicates(subset="ticker", keep="first")
+    combined = pd.concat(identity_frames, ignore_index=True)
 
-    broad = loaded.get("broad")
-    if broad is not None and not broad.empty and not base.empty:
-        base = base.set_index("ticker")
-        broad_lookup = broad.set_index("ticker")
-        for column in _STOCK_MASTER_LIVE_METRIC_COLUMNS:
-            if column not in broad_lookup.columns:
-                continue
-            overlay = broad_lookup[column].reindex(base.index)
-            base[column] = overlay.combine_first(base[column]) if column in base.columns else overlay
-        base = base.reset_index()
-    return base
+    isin_str = combined["isin"].astype("string")
+    has_isin = isin_str.notna() & (isin_str.str.strip() != "")
+    dedup_key = isin_str.where(has_isin, combined["ticker"])
+
+    identity_fill_cols = ["exchange", "security_id", "nse_ticker", "bse_ticker", "nse_security_id", "bse_security_id"]
+    for column in identity_fill_cols:
+        if column in combined.columns:
+            combined[column] = combined.groupby(dedup_key)[column].transform(lambda s: s.ffill().bfill())
+
+    return combined.loc[~dedup_key.duplicated(keep="first")].reset_index(drop=True)
 
 
-def _sync_stock_list_master_safely(caller: str) -> None:
-    """Best-effort refresh of the stock_list master table after a universe CSV changes.
+def _sync_instrument_master_safely(caller: str) -> None:
+    """Best-effort refresh of the instrument_master table after a universe CSV changes.
 
     Deferred import avoids a circular dependency (market_data.py imports this module for
     build_stock_master_frame). Never raises — a sync hiccup must not break the underlying
     universe refresh it's attached to.
     """
     try:
-        from stock_advisor.data.market_data import sync_stock_list_master
+        from stock_advisor.data.market_data import sync_instrument_master
 
-        sync_stock_list_master()
+        sync_instrument_master()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("stock_list sync after %s failed: %s", caller, exc)
+        logger.warning("instrument_master sync after %s failed: %s", caller, exc)
 
 
 def load_stock_universe(
@@ -516,7 +509,7 @@ def refresh_stock_universe(
         "count": len(rows),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _sync_stock_list_master_safely("refresh_stock_universe")
+    _sync_instrument_master_safely("refresh_stock_universe")
     return result
 
 
@@ -571,7 +564,7 @@ def refresh_full_stock_universe(
         "failures": failures[:25],
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _sync_stock_list_master_safely("refresh_full_stock_universe")
+    _sync_instrument_master_safely("refresh_full_stock_universe")
     return result
 
 
@@ -594,7 +587,7 @@ def refresh_bse_stock_universe(
         "source": "dhan_public_scrip_master",
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _sync_stock_list_master_safely("refresh_bse_stock_universe")
+    _sync_instrument_master_safely("refresh_bse_stock_universe")
     return result
 
 
@@ -626,7 +619,7 @@ def refresh_india_stock_universe(
         "source": "dhan_public_scrip_master+nse_full_universe_classification",
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _sync_stock_list_master_safely("refresh_india_stock_universe")
+    _sync_instrument_master_safely("refresh_india_stock_universe")
     return result
 
 

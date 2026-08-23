@@ -9,6 +9,7 @@ from stock_advisor.config.settings import PROJECT_ROOT
 from stock_advisor.data.exchange_eod import clear_exchange_eod_fetch_cache
 from stock_advisor.data.market_data import (
     get_price_cache_status,
+    list_instrument_master_tickers,
     refresh_latest_exchange_eod_cache,
     warm_price_history_cache,
 )
@@ -16,7 +17,6 @@ from stock_advisor.data.nse_indices import clear_nse_index_archive_cache, get_ns
 from stock_advisor.data.universe import (
     DEFAULT_NSE_INDEX_NAME,
     list_stock_universe,
-    load_stock_universe,
     refresh_bse_stock_universe,
     refresh_full_stock_universe,
     refresh_india_stock_universe,
@@ -83,8 +83,9 @@ def run_daily_market_data_refresh(
 
     universe_summary = _capture_step(lambda: list_stock_universe(universe=warm_universe, limit=0))
     steps["warm_universe_summary"] = universe_summary
-    universe_df = load_stock_universe(universe=warm_universe, max_stocks=max_price_symbols)
-    tickers = list(universe_df["ticker"]) if not universe_df.empty else []
+    tickers = list_instrument_master_tickers(warm_universe)
+    if max_price_symbols is not None and max_price_symbols > 0:
+        tickers = tickers[:max_price_symbols]
     if not tickers:
         warnings.append(f"No tickers were available for warm_universe={warm_universe}.")
 
@@ -129,7 +130,7 @@ def run_daily_market_data_refresh(
         "warm_universe": warm_universe,
         "price_period": period,
         "price_interval": interval,
-        "universe_stock_count": int(len(universe_df)),
+        "universe_stock_count": len(tickers),
         "settings": {
             "refresh_universes": refresh_universes,
             "refresh_broad_universe": refresh_broad_universe,

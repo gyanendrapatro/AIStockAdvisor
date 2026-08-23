@@ -35,9 +35,11 @@ from stock_advisor.agents.stock_research_agent import run_stock_research_agent
 from stock_advisor.config.settings import load_watchlists
 from stock_advisor.data.daily_refresh import load_daily_refresh_report, run_daily_market_data_refresh
 from stock_advisor.data.market_data import (
+    backfill_market_cap_from_yfinance,
     get_price_cache_status,
     get_price_history,
-    sync_stock_list_master,
+    list_instrument_master_tickers,
+    sync_instrument_master,
     warm_price_history_cache,
 )
 from stock_advisor.data.universe import list_sector_constituents, list_stock_universe
@@ -111,10 +113,53 @@ def _start_global_refresh_job(*, warm_universe: str, period: str = "2y", interva
     return job
 
 
+@st.cache_resource
+def _market_cap_backfill_jobs() -> dict[str, dict[str, object]]:
+    return {}
+
+
+def _latest_market_cap_backfill_job() -> dict[str, object] | None:
+    jobs = [job for job in _market_cap_backfill_jobs().values() if job.get("scope") == "market_cap_backfill"]
+    if not jobs:
+        return None
+    return sorted(jobs, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
+
+
+def _start_market_cap_backfill_job() -> dict[str, object]:
+    jobs = _market_cap_backfill_jobs()
+    for job in jobs.values():
+        if job.get("scope") == "market_cap_backfill" and job.get("status") == "running":
+            return job
+
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    job: dict[str, object] = {
+        "id": job_id,
+        "scope": "market_cap_backfill",
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    jobs[job_id] = job
+
+    def _runner() -> None:
+        try:
+            result = backfill_market_cap_from_yfinance()
+            job["status"] = "completed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["result"] = result
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = "failed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["error"] = str(exc)
+
+    threading.Thread(target=_runner, name=f"market-cap-backfill-{job_id}", daemon=True).start()
+    return job
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def _global_cache_universe_tickers(universe: str) -> list[str]:
-    summary = list_stock_universe(universe=universe, limit=None)
-    return [row["ticker"] for row in summary.get("stocks", []) if row.get("ticker")]
+    # instrument_master.in_nifty_total_market tags NIFTY Total Market membership explicitly at
+    # sync time, so "broad" is DB-backed too now — no CSV fallback needed for any universe.
+    return list_instrument_master_tickers(universe)
 
 
 _GLOBAL_UNIVERSE_OPTIONS = {
@@ -190,26 +235,47 @@ with st.container():
 
 
 with st.sidebar:
-    st.subheader("Stock List Master")
-    st.caption("Consolidate data/*.csv NSE/BSE universes into the stock_list master table.")
-    _STOCK_LIST_SYNC_OPTIONS = {
+    st.subheader("Instrument Master")
+    st.caption("Consolidate data/*.csv NSE/BSE universes into the instrument_master security table.")
+    _INSTRUMENT_MASTER_SYNC_OPTIONS = {
         "All universes (recommended)": None,
         "Broad NSE Total Market": ["broad"],
         "Full NSE Equity": ["full_nse"],
         "Full BSE Equity": ["full_bse"],
         "All India NSE+BSE": ["all_india"],
     }
-    stock_list_sync_label = st.selectbox(
-        "Universe to sync from", list(_STOCK_LIST_SYNC_OPTIONS), key="stock_list_sync_universe"
+    instrument_master_sync_label = st.selectbox(
+        "Universe to sync from", list(_INSTRUMENT_MASTER_SYNC_OPTIONS), key="instrument_master_sync_universe"
     )
-    if st.button("Update stock_list", key="stock_list_sync_button"):
-        with st.spinner("Syncing stock_list from selected universe CSV(s)..."):
-            st.session_state["stock_list_sync_result"] = sync_stock_list_master(
-                universes=_STOCK_LIST_SYNC_OPTIONS[stock_list_sync_label]
+    if st.button("Update instrument_master", key="instrument_master_sync_button"):
+        with st.spinner("Syncing instrument_master from selected universe CSV(s)..."):
+            st.session_state["instrument_master_sync_result"] = sync_instrument_master(
+                universes=_INSTRUMENT_MASTER_SYNC_OPTIONS[instrument_master_sync_label]
             )
-    stock_list_sync_result = st.session_state.get("stock_list_sync_result")
-    if stock_list_sync_result:
-        st.success(f"Synced {stock_list_sync_result.get('synced_ticker_count', 0)} tickers into stock_list.")
+    instrument_master_sync_result = st.session_state.get("instrument_master_sync_result")
+    if instrument_master_sync_result:
+        st.success(f"Synced {instrument_master_sync_result.get('synced_ticker_count', 0)} tickers into instrument_master.")
+
+    st.divider()
+    st.caption("Backfill market_cap.market_cap via yfinance (per-ticker network call, several minutes for the full universe).")
+    market_cap_job = _latest_market_cap_backfill_job()
+    market_cap_running = bool(market_cap_job and market_cap_job.get("status") == "running")
+    if st.button("Backfill market cap (yfinance)", key="market_cap_backfill_button", disabled=market_cap_running):
+        _start_market_cap_backfill_job()
+        market_cap_job = _latest_market_cap_backfill_job()
+        market_cap_running = True
+    if market_cap_job:
+        mc_status = str(market_cap_job.get("status"))
+        if mc_status == "running":
+            st.info("Backfilling market cap...")
+            st_autorefresh(interval=2500, limit=None, key="market_cap_backfill_autorefresh")
+        elif mc_status == "completed":
+            mc_result = market_cap_job.get("result") or {}
+            st.success(
+                f"Updated {mc_result.get('updated_ticker_count', 0)}/{mc_result.get('requested_ticker_count', 0)} tickers."
+            )
+        elif mc_status == "failed":
+            st.error(f"Market cap backfill failed: {market_cap_job.get('error')}")
 
 
 st.markdown(
