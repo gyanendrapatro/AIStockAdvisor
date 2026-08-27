@@ -41,7 +41,6 @@ from stock_advisor.data.market_data import (
     get_price_cache_status,
     get_price_history,
     list_all_instrument_master_tickers,
-    list_instrument_master_tickers,
     sync_instrument_master,
 )
 from stock_advisor.data.universe import list_sector_constituents, list_stock_universe
@@ -150,57 +149,66 @@ def _start_price_cache_fill_job() -> dict[str, object]:
     return job
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def _global_cache_universe_tickers(universe: str) -> list[str]:
-    # instrument_master.in_nifty_total_market tags NIFTY Total Market membership explicitly at
-    # sync time, so "broad" is DB-backed too now — no CSV fallback needed for any universe.
-    return list_instrument_master_tickers(universe)
+@st.fragment
+def _render_market_cap_backfill_status() -> None:
+    # Fragment-scoped so its autorefresh only reruns this block, not the whole sidebar/page —
+    # otherwise every 2.5s tick would reset the sidebar's scroll position for anyone scrolled
+    # further down while a backfill is running.
+    market_cap_job = _latest_market_cap_backfill_job()
+    market_cap_running = bool(market_cap_job and market_cap_job.get("status") == "running")
+    if st.button("Backfill market cap (yfinance)", key="market_cap_backfill_button", disabled=market_cap_running):
+        _start_market_cap_backfill_job()
+        market_cap_job = _latest_market_cap_backfill_job()
+        market_cap_running = True
+    if market_cap_job:
+        mc_status = str(market_cap_job.get("status"))
+        if mc_status == "running":
+            st.info("Backfilling market cap...")
+            st_autorefresh(interval=2500, limit=None, key="market_cap_backfill_autorefresh")
+        elif mc_status == "completed":
+            mc_result = market_cap_job.get("result") or {}
+            st.success(
+                f"Updated {mc_result.get('updated_ticker_count', 0)}/{mc_result.get('requested_ticker_count', 0)} tickers."
+            )
+        elif mc_status == "failed":
+            st.error(f"Market cap backfill failed: {market_cap_job.get('error')}")
 
 
-_GLOBAL_UNIVERSE_OPTIONS = {
-    "Full NSE": "full_nse",
-    "Broad NSE Total Market": "broad",
-    "All India NSE+BSE": "all_india",
-}
-
-
-with st.container():
-    # Read-only status display — the price cache is only ever written to from the sidebar's
-    # "Refresh price cache" button (or the daily_refresh CLI / warm_price_history_cache MCP
-    # tool), never from here. This just shows current coverage for the selected universe.
-    global_universe_label = st.selectbox(
-        "Cache universe",
-        list(_GLOBAL_UNIVERSE_OPTIONS),
-        index=0,
-        key="global_cache_universe",
-        label_visibility="collapsed",
-    )
-    global_universe = _GLOBAL_UNIVERSE_OPTIONS[global_universe_label]
-
-    global_tickers = _global_cache_universe_tickers(global_universe)
-    global_cache_status = get_price_cache_status(tickers=global_tickers, interval="1d")
-    if global_cache_status.get("enabled"):
-        gc_cached = global_cache_status.get("cached_ticker_count", 0)
-        gc_fresh = global_cache_status.get("fresh_ticker_count", 0)
-        gc_stale = global_cache_status.get("stale_ticker_count", 0)
-        gc_missing = global_cache_status.get("missing_ticker_count", 0)
-        gc_requested = global_cache_status.get("requested_ticker_count") or len(global_tickers)
-        gc_coverage = global_cache_status.get("fresh_coverage_pct")
-        gc_coverage_text = f"{gc_coverage}%" if gc_coverage is not None else "n/a"
-        st.caption(
-            f"SQLite price cache ({global_universe_label}): {gc_fresh}/{gc_requested} fresh ({gc_coverage_text}), "
-            f"{gc_stale} stale, {gc_missing} missing, {gc_cached} cached total. "
-            "Use 'Refresh price cache' in the sidebar to update it."
-        )
-
-    cold_start_report = load_daily_refresh_report()
-    if cold_start_report:
-        st.caption(
-            f"Last refresh: {str(cold_start_report.get('completed_at', 'n/a'))[:19]}Z, "
-            f"status={cold_start_report.get('status', 'n/a')}."
-        )
-    else:
-        st.caption("No refresh has been run yet.")
+@st.fragment
+def _render_price_cache_fill_status() -> None:
+    # Same fragment-scoping reason as _render_market_cap_backfill_status above.
+    price_fill_job = _latest_price_cache_fill_job()
+    price_fill_running = bool(price_fill_job and price_fill_job.get("status") == "running")
+    if st.button("Refresh price cache", key="price_cache_fill_button", disabled=price_fill_running):
+        _start_price_cache_fill_job()
+        price_fill_job = _latest_price_cache_fill_job()
+        price_fill_running = True
+    if price_fill_job:
+        pf_status = str(price_fill_job.get("status"))
+        if pf_status == "running":
+            pf_progress = price_fill_job.get("progress") or {}
+            st.info(
+                f"Refreshing from {pf_progress.get('source', '?')}... phase={pf_progress.get('phase', '?')} "
+                f"{pf_progress.get('completed', 0)}/{pf_progress.get('total', 0)}"
+            )
+            st_autorefresh(interval=2500, limit=None, key="price_cache_fill_autorefresh")
+        elif pf_status == "completed":
+            pf_result = price_fill_job.get("result") or {}
+            st.success(
+                f"Done: {pf_result.get('skipped_up_to_date_count', 0)} already current, "
+                f"{pf_result.get('full_fetch_count', 0)} full-fetched, "
+                f"{pf_result.get('backward_fetch_count', 0)} back-filled (start date), "
+                f"{pf_result.get('forward_fetch_count', 0)} forward-updated (latest days), "
+                f"{pf_result.get('failed_count', 0)} failed."
+            )
+            if pf_result.get("bhavcopy_fallback_recovered_count") or pf_result.get("dormant_marked_count"):
+                st.caption(
+                    f"Bhavcopy fallback: {pf_result.get('bhavcopy_fallback_recovered_count', 0)} recovered "
+                    f"with real history, {pf_result.get('dormant_marked_count', 0)} marked dormant "
+                    f"(active=0, no trades since {pf_result.get('start_date', 'the configured floor')})."
+                )
+        elif pf_status == "failed":
+            st.error(f"Price cache refresh failed: {price_fill_job.get('error')}")
 
 
 with st.sidebar:
@@ -227,63 +235,26 @@ with st.sidebar:
 
     st.divider()
     st.caption("Backfill market_cap.market_cap via yfinance (per-ticker network call, several minutes for the full universe).")
-    market_cap_job = _latest_market_cap_backfill_job()
-    market_cap_running = bool(market_cap_job and market_cap_job.get("status") == "running")
-    if st.button("Backfill market cap (yfinance)", key="market_cap_backfill_button", disabled=market_cap_running):
-        _start_market_cap_backfill_job()
-        market_cap_job = _latest_market_cap_backfill_job()
-        market_cap_running = True
-    if market_cap_job:
-        mc_status = str(market_cap_job.get("status"))
-        if mc_status == "running":
-            st.info("Backfilling market cap...")
-            st_autorefresh(interval=2500, limit=None, key="market_cap_backfill_autorefresh")
-        elif mc_status == "completed":
-            mc_result = market_cap_job.get("result") or {}
-            st.success(
-                f"Updated {mc_result.get('updated_ticker_count', 0)}/{mc_result.get('requested_ticker_count', 0)} tickers."
-            )
-        elif mc_status == "failed":
-            st.error(f"Market cap backfill failed: {market_cap_job.get('error')}")
+    _render_market_cap_backfill_status()
 
     st.divider()
     st.subheader("Price History Cache")
     st.caption(
-        "Fills price_history_cache for every instrument_master ticker. Already-current tickers "
-        "are skipped; only missing/new dates are fetched. This is the only place prices are "
-        "pulled from — everywhere else in the app just reads what's cached here."
+        "Fills price_history_cache for every instrument_master ticker. Recent days are checked "
+        "against official NSE/BSE bhavcopy first (free, authoritative); Yahoo fills whatever's "
+        "still missing, with bhavcopy as a full-history fallback if Yahoo has nothing for a "
+        "ticker. Already-current tickers are skipped. This is the only place prices are pulled "
+        "from — everywhere else in the app just reads what's cached here."
     )
-    price_fill_job = _latest_price_cache_fill_job()
-    price_fill_running = bool(price_fill_job and price_fill_job.get("status") == "running")
-    if st.button("Refresh price cache", key="price_cache_fill_button", disabled=price_fill_running):
-        _start_price_cache_fill_job()
-        price_fill_job = _latest_price_cache_fill_job()
-        price_fill_running = True
-    if price_fill_job:
-        pf_status = str(price_fill_job.get("status"))
-        if pf_status == "running":
-            pf_progress = price_fill_job.get("progress") or {}
-            st.info(
-                f"Refreshing... phase={pf_progress.get('phase', '?')} "
-                f"{pf_progress.get('completed', 0)}/{pf_progress.get('total', 0)}"
-            )
-            st_autorefresh(interval=2500, limit=None, key="price_cache_fill_autorefresh")
-        elif pf_status == "completed":
-            pf_result = price_fill_job.get("result") or {}
-            st.success(
-                f"Done: {pf_result.get('skipped_up_to_date_count', 0)} already current, "
-                f"{pf_result.get('full_fetch_count', 0)} full-fetched, "
-                f"{pf_result.get('backward_fetch_count', 0)} back-filled (start date), "
-                f"{pf_result.get('forward_fetch_count', 0)} forward-updated (latest days), "
-                f"{pf_result.get('failed_count', 0)} failed."
-            )
-        elif pf_status == "failed":
-            st.error(f"Price cache refresh failed: {price_fill_job.get('error')}")
+    _render_price_cache_fill_status()
 
 
 st.markdown(
     """
     <style>
+    [data-testid="stMainBlockContainer"] {
+        padding-top: 2rem;
+    }
     .sector-side-panel {
         border: 1px solid rgba(148, 163, 184, 0.28);
         border-radius: 8px;
@@ -435,9 +406,8 @@ def _warn_if_cache_not_ready(
     include_bse: bool | None = None,
 ) -> dict[str, object]:
     """Read-only cache-readiness check. Never starts a refresh — the price cache is only ever
-    written to from the sidebar's "Refresh price cache" button (or the daily_refresh CLI /
-    warm_price_history_cache MCP tool). If coverage is short, just warn and proceed with
-    whatever's cached."""
+    written to from the sidebar's "Refresh price cache" button (or the daily_refresh CLI/cron).
+    If coverage is short, just warn and proceed with whatever's cached."""
     warm_universe = _daily_refresh_universe(universe)
     cache_ready, cache_readiness = _latest_cache_ready_for_universe(warm_universe)
     if cache_ready:
