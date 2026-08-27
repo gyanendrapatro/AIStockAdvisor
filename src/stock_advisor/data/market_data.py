@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 import logging
 import os
 import sqlite3
@@ -13,7 +13,11 @@ import pandas as pd
 import yfinance as yf
 
 from stock_advisor.config.settings import settings
-from stock_advisor.data.exchange_eod import get_latest_exchange_eod_rows
+from stock_advisor.data.exchange_eod import (
+    bhavcopy_fetch_succeeded_for_date,
+    get_exchange_eod_rows_for_date,
+    get_latest_exchange_eod_rows,
+)
 from stock_advisor.data.sec_edgar import get_sec_fundamentals
 from stock_advisor.data.ownership import get_ownership_fundamentals
 from stock_advisor.data.universe import (
@@ -58,7 +62,7 @@ def get_price_history(ticker: str, period: str = "6mo", interval: str = "1d") ->
     Pure read from price_history_cache — this never calls a market data provider and
     never writes anything. The only place price history is ever fetched and stored is
     fill_price_cache_for_universe(), triggered from the sidebar's "Refresh price cache"
-    button, the daily_refresh CLI, or the warm_price_history_cache MCP tool. If nothing
+    button or the daily_refresh CLI/cron — no MCP tool ever fetches live. If nothing
     is cached yet for this ticker (or the cached period is shorter than requested), this
     returns an empty DataFrame — callers should surface CACHE_REFRESH_HINT to the user.
     """
@@ -1173,6 +1177,141 @@ def refresh_latest_exchange_eod_cache(
     }
 
 
+def backfill_bhavcopy_history(
+    tickers: list[str] | tuple[str, ...],
+    *,
+    start_date: str,
+    end_date: str | None = None,
+    interval: str = "1d",
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Backfill price_history_cache from official NSE/BSE bhavcopy archives, day by day.
+
+    For tickers Yahoo has no data for (typically SME/illiquid listings the exchanges'
+    own bhavcopy still carries in full — see get_exchange_eod_rows_for_date's SM/ST/BE/BZ
+    series handling), this walks every trading day in [start_date, end_date] instead of
+    diffing against price_cache_meta, since these tickers have no meta row to diff against.
+
+    Cost scales with the number of trading days requested, not the ticker count: each day is
+    one NSE + one BSE bhavcopy fetch (the whole exchange), filtered in-memory for the requested
+    tickers, not one fetch per ticker.
+    """
+    if str(interval).strip().lower() != "1d":
+        return {"requested_ticker_count": 0, "warnings": ["Bhavcopy backfill only supports 1d interval."]}
+
+    unique_tickers = list(dict.fromkeys(_cache_ticker(ticker) for ticker in tickers if _cache_ticker(ticker)))
+    if not unique_tickers:
+        return {
+            "requested_ticker_count": 0,
+            "trading_days_scanned": 0,
+            "tickers_with_data_count": 0,
+            "tickers_without_data_count": 0,
+        }
+
+    start = datetime.strptime(str(start_date), "%Y-%m-%d").date()
+    end = datetime.strptime(str(end_date), "%Y-%m-%d").date() if end_date else _current_market_datetime().date()
+
+    trade_dates: list[date] = []
+    cursor = start
+    while cursor <= end:
+        if cursor.weekday() < 5:
+            trade_dates.append(cursor)
+        cursor += timedelta(days=1)
+
+    frames_by_ticker: dict[str, list[pd.DataFrame]] = {ticker: [] for ticker in unique_tickers}
+    provider_counts: dict[str, int] = {}
+    days_with_data = 0
+
+    for index, trade_date in enumerate(trade_dates):
+        day_rows = get_exchange_eod_rows_for_date(unique_tickers, trade_date)
+        # Connectivity signal is deliberately independent of whether OUR tickers matched --
+        # see bhavcopy_fetch_succeeded_for_date's docstring. A day where the exchange responded
+        # but none of our (possibly all-dormant) candidates traded must still count as "covered".
+        if bhavcopy_fetch_succeeded_for_date(trade_date):
+            days_with_data += 1
+        for ticker, frame in day_rows.items():
+            if frame is None or frame.empty:
+                continue
+            frames_by_ticker[ticker].append(frame)
+            provider = str(frame.attrs.get("provider") or "exchange_eod")
+            provider_counts[provider] = provider_counts.get(provider, 0) + 1
+        if progress_callback:
+            progress_callback({"phase": "scanning_days", "source": "bhavcopy", "completed": index + 1, "total": len(trade_dates)})
+
+    stored_count = 0
+    for ticker, day_frames in frames_by_ticker.items():
+        if day_frames:
+            combined = pd.concat(day_frames, ignore_index=True)
+            combined.attrs["provider"] = str(day_frames[-1].attrs.get("provider") or "exchange_eod_bhavcopy")
+            _store_price_history(ticker, interval, combined)
+            stored_count += 1
+
+    no_data_tickers = [ticker for ticker, day_frames in frames_by_ticker.items() if not day_frames]
+    return {
+        "requested_ticker_count": len(unique_tickers),
+        "trading_days_scanned": len(trade_dates),
+        "trading_days_with_bhavcopy_data": days_with_data,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "tickers_with_data_count": stored_count,
+        "tickers_without_data_count": len(no_data_tickers),
+        "no_data_tickers": no_data_tickers[:50],
+        "providers": provider_counts,
+        "cache_status": get_price_cache_status(unique_tickers, interval=interval),
+    }
+
+
+def _tickers_without_price_cache(
+    *, interval: str = "1d", active_only: bool = True, tickers: list[str] | None = None
+) -> list[str]:
+    """instrument_master tickers with no price_cache_meta row at all for this interval —
+    i.e. every prior fetch attempt (Yahoo or bhavcopy) has come up completely empty for them.
+    Optionally scoped to a given ticker list rather than the whole table."""
+    where_active = "im.active IS NOT 0" if active_only else "1=1"
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        if tickers is not None:
+            unique = list(dict.fromkeys(_cache_ticker(t) for t in tickers if _cache_ticker(t)))
+            if not unique:
+                return []
+            placeholders = ",".join("?" for _ in unique)
+            rows = conn.execute(
+                f"""
+                SELECT im.ticker AS ticker
+                FROM instrument_master im
+                LEFT JOIN price_cache_meta m ON m.ticker_id = im.ticker_id AND m.interval = ?
+                WHERE m.ticker_id IS NULL AND {where_active} AND im.ticker IN ({placeholders})
+                """,
+                [interval, *unique],
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""
+                SELECT im.ticker AS ticker
+                FROM instrument_master im
+                LEFT JOIN price_cache_meta m ON m.ticker_id = im.ticker_id AND m.interval = ?
+                WHERE m.ticker_id IS NULL AND {where_active}
+                """,
+                [interval],
+            ).fetchall()
+    return [row["ticker"] for row in rows]
+
+
+def _mark_tickers_dormant(tickers: list[str]) -> int:
+    """Set instrument_master.active = 0 for the given tickers. Used when neither Yahoo nor a
+    full bhavcopy day-walk of the configured history window found a single trade for a ticker —
+    list_all_instrument_master_tickers(active_only=True) then excludes it from future refreshes."""
+    unique = list(dict.fromkeys(_cache_ticker(t) for t in tickers if _cache_ticker(t)))
+    if not unique:
+        return 0
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        placeholders = ",".join("?" for _ in unique)
+        conn.execute(f"UPDATE instrument_master SET active = 0 WHERE ticker IN ({placeholders})", unique)
+        conn.commit()
+    return len(unique)
+
+
 def _most_recent_expected_trading_day() -> str:
     """The latest calendar date price_cache_meta.latest_date should have reached, ignoring
     market holidays (only weekends are excluded). Before the daily close buffer, "today" isn't
@@ -1226,20 +1365,38 @@ def fill_price_cache_for_universe(
     This is the one place price history is ever fetched from a provider and written to
     price_history_cache/price_cache_meta/price_data/live_metrics. Everywhere else in the app
     (get_price_history, get_price_histories, and everything built on them) only reads whatever
-    is cached here. Triggered from the sidebar's "Refresh price cache" button, the daily_refresh
-    CLI, and the warm_price_history_cache MCP tool.
+    is cached here. Triggered from the sidebar's "Refresh price cache" button and the
+    daily_refresh CLI/cron — no MCP tool ever triggers a live fetch.
 
-    Per ticker:
-      - no price_cache_meta row at all -> full-range fetch from start_date to today.
+    Fetch order (bhavcopy is authoritative and free -- one exchange-wide file per day, cost
+    independent of ticker count -- so it's preferred wherever it's cheap to check; Yahoo is
+    preferred for a bulk multi-year pull when it's likely to work, with bhavcopy as its fallback):
+
+      0. Priority pass (ALL requested tickers, every call): walk the last
+         bhavcopy_priority_window_days of official NSE/BSE bhavcopy first, before anything else.
+         INSERT OR REPLACE means any date bhavcopy has here overwrites whatever was cached for it
+         before (including a prior Yahoo-sourced row) -- this is what makes a previous run's
+         Yahoo-filled "latest day" get superseded by bhavcopy on the very next refresh, once
+         bhavcopy has published it.
+
+    Per ticker, classified against price_cache_meta as it stands *after* the priority pass:
+      - no price_cache_meta row at all -> full-range Yahoo fetch from start_date to today.
       - cached earliest_date is after start_date (the configured floor moved earlier than
-        what's cached) -> backward-fill fetch from start_date to the existing earliest_date.
-      - cached latest_date is behind the most recent expected trading day -> forward fetch
+        what's cached) -> backward-fill Yahoo fetch from start_date to the existing earliest_date.
+      - cached latest_date is behind the most recent expected trading day -> forward Yahoo fetch
         from latest_date (inclusive, to safely re-cover a possibly-incomplete last row) to today.
       - needs both backward and forward -> treated as a full-range fetch (start_date to today);
         INSERT OR REPLACE makes re-covering the already-cached middle harmless, and this
         combination is rare (only right after preponing start_date while also being behind on
         the latest day).
       - neither -> skipped, zero network calls.
+
+      Fallback pass: any full_fetch/backward_fetch ticker Yahoo still failed on (forward_fetch
+      failures are skipped here -- the priority pass just tried the same recent window moments
+      earlier) gets a full bhavcopy day-walk over [start_date, today]. A ticker with zero trades
+      on either exchange across that entire range is marked instrument_master.active=0 (dormant)
+      so future refreshes stop retrying it -- guarded by a bhavcopy day-coverage check so a
+      transient NSE/BSE outage during the walk can't be misread as mass delisting.
     """
     effective_start_date = str(start_date or settings.price_history_start_date).strip()
     unique_tickers = list(dict.fromkeys(_cache_ticker(ticker) for ticker in tickers if _cache_ticker(ticker)))
@@ -1251,12 +1408,39 @@ def fill_price_cache_for_universe(
             "full_fetch_count": 0,
             "backward_fetch_count": 0,
             "forward_fetch_count": 0,
+            "bhavcopy_fallback_recovered_count": 0,
+            "dormant_marked_count": 0,
+            "dormant_tickers": [],
             "failed_count": 0,
             "failed_tickers": [],
+            "start_date": effective_start_date,
         }
 
+    def _wrapped_progress(stage: str) -> Callable[[dict[str, Any]], None] | None:
+        if not progress_callback:
+            return None
+
+        def _inner(update: dict[str, Any]) -> None:
+            tagged = dict(update)
+            tagged["phase"] = f"{stage}_{update.get('phase', '')}"
+            progress_callback(tagged)
+
+        return _inner
+
+    today_date = _current_market_datetime().date()
     expected_trading_day = _most_recent_expected_trading_day()
-    end_exclusive = (_current_market_datetime().date() + timedelta(days=1)).isoformat()
+    end_exclusive = (today_date + timedelta(days=1)).isoformat()
+
+    priority_window_days = max(0, int(settings.bhavcopy_priority_window_days))
+    if priority_window_days > 0 and interval == "1d":
+        priority_start = (today_date - timedelta(days=priority_window_days)).isoformat()
+        backfill_bhavcopy_history(
+            unique_tickers,
+            start_date=priority_start,
+            end_date=today_date.isoformat(),
+            interval=interval,
+            progress_callback=_wrapped_progress("bhavcopy_priority"),
+        )
 
     with _price_cache_connection() as conn:
         _ensure_price_cache_schema(conn)
@@ -1302,7 +1486,7 @@ def fill_price_cache_for_universe(
 
     def _report(phase: str) -> None:
         if progress_callback:
-            progress_callback({"phase": phase, "completed": completed, "total": total})
+            progress_callback({"phase": phase, "source": "yfinance", "completed": completed, "total": total})
 
     _report("classifying")
 
@@ -1326,6 +1510,8 @@ def fill_price_cache_for_universe(
             remaining = still_remaining
         failed.extend(remaining)
 
+    forward_fetch_tickers = {ticker for group in forward_by_date.values() for ticker in group}
+
     if full_fetch:
         _fetch_group("full_fetch", full_fetch, effective_start_date, end_exclusive)
     for earliest_date, group_tickers in backward_by_date.items():
@@ -1333,14 +1519,47 @@ def fill_price_cache_for_universe(
     for latest_date, group_tickers in forward_by_date.items():
         _fetch_group("forward_fetch", group_tickers, latest_date, end_exclusive)
 
+    # Fallback pass: only full_fetch/backward_fetch failures need this -- the priority pass
+    # already just tried the recent window for every ticker (including forward_fetch failures)
+    # moments ago, so retrying those via bhavcopy again wouldn't find anything new.
+    bhavcopy_fallback_recovered_count = 0
+    dormant_marked_count = 0
+    dormant_tickers: list[str] = []
+    phase_c_candidates = [ticker for ticker in failed if ticker not in forward_fetch_tickers]
+    if phase_c_candidates and interval == "1d":
+        fallback_result = backfill_bhavcopy_history(
+            phase_c_candidates,
+            start_date=effective_start_date,
+            end_date=today_date.isoformat(),
+            interval=interval,
+            progress_callback=_wrapped_progress("bhavcopy_fallback"),
+        )
+        scanned = int(fallback_result.get("trading_days_scanned") or 0)
+        covered = int(fallback_result.get("trading_days_with_bhavcopy_data") or 0)
+        coverage_pct = round(100 * covered / scanned, 2) if scanned else 0.0
+
+        still_missing = set(_tickers_without_price_cache(interval=interval, active_only=True, tickers=phase_c_candidates))
+        recovered = [ticker for ticker in phase_c_candidates if ticker not in still_missing]
+        bhavcopy_fallback_recovered_count = len(recovered)
+        failed = [ticker for ticker in failed if ticker not in recovered]
+
+        if still_missing and coverage_pct >= settings.min_bhavcopy_coverage_pct:
+            dormant_marked_count = _mark_tickers_dormant(list(still_missing))
+            dormant_tickers = sorted(still_missing)[:50]
+            failed = [ticker for ticker in failed if ticker not in still_missing]
+
     return {
         "requested_ticker_count": total,
         "skipped_up_to_date_count": skipped_count,
         "full_fetch_count": fetched_counts["full_fetch"],
         "backward_fetch_count": fetched_counts["backward_fetch"],
         "forward_fetch_count": fetched_counts["forward_fetch"],
+        "bhavcopy_fallback_recovered_count": bhavcopy_fallback_recovered_count,
+        "dormant_marked_count": dormant_marked_count,
+        "dormant_tickers": dormant_tickers,
         "failed_count": len(failed),
         "failed_tickers": failed[:50],
+        "start_date": effective_start_date,
         "cache_status": get_price_cache_status(unique_tickers, interval=interval),
     }
 

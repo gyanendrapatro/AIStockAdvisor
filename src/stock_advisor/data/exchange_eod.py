@@ -46,27 +46,43 @@ def get_latest_exchange_eod_rows(tickers: list[str] | tuple[str, ...], *, lookba
 
 
 def get_exchange_eod_rows_for_date(tickers: list[str] | tuple[str, ...], trade_date: date) -> dict[str, pd.DataFrame]:
-    """Return official NSE/BSE EOD rows for a specific date keyed by input ticker."""
+    """Return official NSE/BSE EOD rows for a specific date keyed by input ticker.
+
+    .BO tickers are keyed by BSE's numeric scrip code (FinInstrmId in the bhavcopy), not by
+    TckrSymb — BSE's bhavcopy symbol column is always the short text symbol (e.g. "ABB"), which
+    never matches a "544412.BO"-style ticker. Matching by scrip code instead of symbol is what
+    makes the ~2,600 numeric-code BSE tickers in instrument_master resolvable here at all.
+    """
     ticker_keys = list(dict.fromkeys(_normalize_ticker(ticker) for ticker in tickers if _normalize_ticker(ticker)))
     if not ticker_keys:
         return {}
 
     nse_symbols = {_ticker_symbol(ticker) for ticker in ticker_keys if not ticker.endswith(".BO")}
-    bse_symbols = {_ticker_symbol(ticker) for ticker in ticker_keys if ticker.endswith(".BO")}
-    nse_rows = _bhavcopy_rows_by_symbol(_fetch_nse_bhavcopy(trade_date), nse_symbols) if nse_symbols else {}
+    bse_scrip_codes = {_ticker_symbol(ticker) for ticker in ticker_keys if ticker.endswith(".BO")}
+    nse_rows = _bhavcopy_rows_by_key(_fetch_nse_bhavcopy(trade_date), nse_symbols, key_column="symbol") if nse_symbols else {}
 
+    # NSE-missing fallback still looks up by text symbol (an NSE ticker's symbol, not a scrip
+    # code), so it stays keyed on "symbol" — separate from the .BO scrip-code lookup above.
     missing_nse_symbols = {
         _ticker_symbol(ticker)
         for ticker in ticker_keys
         if not ticker.endswith(".BO") and _ticker_symbol(ticker) not in nse_rows
     }
-    bse_lookup_symbols = bse_symbols | missing_nse_symbols
-    bse_rows = _bhavcopy_rows_by_symbol(_fetch_bse_bhavcopy(trade_date), bse_lookup_symbols) if bse_lookup_symbols else {}
+    bse_rows_by_symbol = (
+        _bhavcopy_rows_by_key(_fetch_bse_bhavcopy(trade_date), missing_nse_symbols, key_column="symbol")
+        if missing_nse_symbols
+        else {}
+    )
+    bse_rows_by_scrip_code = (
+        _bhavcopy_rows_by_key(_fetch_bse_bhavcopy(trade_date), bse_scrip_codes, key_column="scrip_code")
+        if bse_scrip_codes
+        else {}
+    )
 
     out: dict[str, pd.DataFrame] = {}
     for ticker in ticker_keys:
         symbol = _ticker_symbol(ticker)
-        row = bse_rows.get(symbol) if ticker.endswith(".BO") else nse_rows.get(symbol) or bse_rows.get(symbol)
+        row = bse_rows_by_scrip_code.get(symbol) if ticker.endswith(".BO") else nse_rows.get(symbol) or bse_rows_by_symbol.get(symbol)
         if row is None:
             continue
         frame = pd.DataFrame([row])
@@ -76,6 +92,23 @@ def get_exchange_eod_rows_for_date(tickers: list[str] | tuple[str, ...], trade_d
         out[ticker] = frame[["date", "open", "high", "low", "close", "volume", "turnover"]]
         out[ticker].attrs.update(frame.attrs)
     return out
+
+
+def bhavcopy_fetch_succeeded_for_date(trade_date: date) -> bool:
+    """True if at least one exchange's bhavcopy actually returned data for this date.
+
+    A day-level connectivity signal, deliberately independent of which tickers a caller happens
+    to be filtering for — get_exchange_eod_rows_for_date's *filtered* result can legitimately be
+    empty on a perfectly healthy day (none of the requested tickers traded, or none are in this
+    exchange's file), and that must not be confused with the bhavcopy fetch itself having failed
+    (network error, holiday, exchange outage). Callers doing a day-coverage sanity check (e.g.
+    before treating a run of "no data" days as evidence of ticker dormancy) should use this, not
+    the presence/absence of rows in a filtered result.
+
+    Free to call after get_exchange_eod_rows_for_date for the same date — both underlying fetches
+    are lru_cache'd, so this never triggers an extra network request.
+    """
+    return not _fetch_nse_bhavcopy(trade_date).empty or not _fetch_bse_bhavcopy(trade_date).empty
 
 
 def clear_exchange_eod_fetch_cache() -> None:
@@ -152,6 +185,7 @@ def _normalize_bhavcopy(raw: pd.DataFrame, *, provider: str) -> pd.DataFrame:
         {
             "date": pd.to_datetime(raw["TradDt"], errors="coerce"),
             "symbol": raw["TckrSymb"].astype(str).str.strip().str.upper(),
+            "scrip_code": raw.get("FinInstrmId", pd.Series([None] * len(raw))).map(_clean_scrip_code),
             "series": raw.get("SctySrs", pd.Series([""] * len(raw))).astype(str).str.strip().str.upper(),
             "instrument_type": raw.get("FinInstrmTp", pd.Series([""] * len(raw))).astype(str).str.strip().str.upper(),
             "open": pd.to_numeric(raw["OpnPric"], errors="coerce"),
@@ -169,15 +203,26 @@ def _normalize_bhavcopy(raw: pd.DataFrame, *, provider: str) -> pd.DataFrame:
     return out
 
 
-def _bhavcopy_rows_by_symbol(df: pd.DataFrame, symbols: set[str]) -> dict[str, dict[str, Any]]:
-    if df.empty or not symbols:
+def _bhavcopy_rows_by_key(df: pd.DataFrame, keys: set[str], *, key_column: str) -> dict[str, dict[str, Any]]:
+    if df.empty or not keys or key_column not in df.columns:
         return {}
-    selected = df[df["symbol"].isin(symbols)].copy()
+    selected = df[df[key_column].isin(keys)].copy()
     if selected.empty:
         return {}
     selected["series_rank"] = selected["series"].map({"EQ": 0, "BE": 1, "BZ": 2, "SM": 3, "ST": 4}).fillna(9)
-    selected = selected.sort_values(["symbol", "series_rank"]).drop_duplicates("symbol", keep="first")
-    return {str(row.symbol): row._asdict() for row in selected.itertuples(index=False)}
+    selected = selected.sort_values([key_column, "series_rank"]).drop_duplicates(key_column, keep="first")
+    return {str(getattr(row, key_column)): row._asdict() for row in selected.itertuples(index=False)}
+
+
+def _clean_scrip_code(value: Any) -> str | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
 
 
 def _normalize_ticker(ticker: str) -> str:

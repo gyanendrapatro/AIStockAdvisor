@@ -139,7 +139,9 @@ The Streamlit Universe tab can audit `broad`, `full_nse`, `full_bse`, and
 `all_india`. Sector and industry analytics default to full NSE because NSE
 provides cleaner sector/basic-industry metadata. The combined NSE+BSE universe
 keeps BSE-only rows too, but those can remain unclassified until a public sector
-source is available for that ISIN. MCP tools expose the same path:
+source is available for that ISIN. MCP tools expose the same path (read-only — MCP has no tool
+that triggers a live price-history fetch; that only ever happens from the sidebar's "Refresh
+price cache" button or the daily_refresh CLI/cron shown above):
 
 - `list_stock_universe`
 - `refresh_stock_universe`
@@ -147,7 +149,7 @@ source is available for that ISIN. MCP tools expose the same path:
 - `refresh_bse_stock_universe`
 - `refresh_india_stock_universe`
 - `refresh_latest_exchange_eod_cache`
-- `run_daily_market_data_refresh`
+- `get_price_cache_status`
 - `get_sector_analytics`
 - `list_industry_definitions`
 - `get_industry_analytics`
@@ -256,7 +258,7 @@ Example MCP tools:
 - `refresh_bse_stock_universe`
 - `refresh_india_stock_universe`
 - `refresh_latest_exchange_eod_cache`
-- `run_daily_market_data_refresh`
+- `get_price_cache_status`
 - `list_sector_definitions`
 - `get_sector_rotation`
 - `rank_sector_stocks`

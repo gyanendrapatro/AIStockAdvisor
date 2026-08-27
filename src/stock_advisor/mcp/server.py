@@ -50,15 +50,12 @@ from stock_advisor.data.dhan import (
 )
 from stock_advisor.data.market_data import (
     CACHE_REFRESH_HINT,
-    fill_price_cache_for_universe as _fill_price_cache_for_universe,
     get_basic_fundamentals as _get_basic_fundamentals,
     get_price_cache_status as _get_price_cache_status,
     get_price_history as _get_price_history,
-    list_all_instrument_master_tickers as _list_all_instrument_master_tickers,
     list_instrument_master_tickers as _list_instrument_master_tickers,
     refresh_latest_exchange_eod_cache as _refresh_latest_exchange_eod_cache,
 )
-from stock_advisor.data.daily_refresh import run_daily_market_data_refresh as _run_daily_market_data_refresh
 from stock_advisor.data.news import get_news as _get_news
 from stock_advisor.data.ownership import (
     get_ownership_fundamentals as _get_ownership_fundamentals,
@@ -114,7 +111,7 @@ def server_info() -> dict[str, Any]:
             "refresh_india_stock_universe",
             "refresh_stock_universe",
             "refresh_latest_exchange_eod_cache",
-            "run_daily_market_data_refresh",
+            "get_price_cache_status",
             "list_sector_definitions",
             "get_sector_rotation",
             "rank_sector_stocks",
@@ -530,95 +527,22 @@ def refresh_latest_exchange_eod_cache(
     return sanitize_for_json(result)
 
 
-@mcp.tool("run_daily_market_data_refresh")
-def run_daily_market_data_refresh(
-    universe: str = "full_nse",
-    period: str = "2y",
-    interval: str = "1d",
-    refresh_universes: bool = True,
-    refresh_full_nse_universe: bool = True,
-    refresh_broad_universe: bool = True,
-    refresh_bse_universe: bool = False,
-    refresh_india_universe: bool = False,
-    warm_price_cache: bool = True,
-    refresh_exchange_eod: bool = True,
-    max_universe_symbols: int | None = None,
-    max_price_symbols: int | None = None,
-    chunk_size: int = 80,
-    retry_attempts: int = 2,
-    start_date: str | None = None,
-) -> dict[str, Any]:
-    """Run the daily public NSE/BSE refresh job and return the JSON report.
-
-    Price-cache warming is incremental (fill_price_cache_for_universe): already-current
-    tickers are skipped, not re-fetched. start_date overrides PRICE_HISTORY_START_DATE
-    (from .env) as the backfill floor for this run only.
-    """
-    return sanitize_for_json(
-        _run_daily_market_data_refresh(
-            refresh_universes=refresh_universes,
-            refresh_broad_universe=refresh_broad_universe,
-            refresh_full_nse_universe=refresh_full_nse_universe,
-            refresh_bse_universe=refresh_bse_universe,
-            refresh_india_universe=refresh_india_universe,
-            warm_price_cache=warm_price_cache,
-            refresh_exchange_eod=refresh_exchange_eod,
-            warm_universe=universe,
-            period=period,
-            interval=interval,
-            max_universe_symbols=max_universe_symbols,
-            max_price_symbols=max_price_symbols,
-            chunk_size=chunk_size,
-            retry_attempts=retry_attempts,
-            start_date=start_date,
-        )
-    )
-
-
 @mcp.tool("get_price_cache_status")
 def get_price_cache_status(
     universe: str = "full_nse",
     interval: str = "1d",
     max_universe_stocks: int | None = None,
 ) -> dict[str, Any]:
-    """Return SQLite OHLCV cache coverage for the selected stock universe."""
+    """Return SQLite OHLCV cache coverage for the selected stock universe.
+
+    Read-only. Fetching/writing price history only ever happens from the sidebar's "Refresh
+    price cache" button or the daily_refresh CLI/cron job (fill_price_cache_for_universe) — MCP
+    has no tool that triggers a live fetch; this just reports what's already cached.
+    """
     tickers = _list_instrument_master_tickers(universe)
     if max_universe_stocks is not None and max_universe_stocks > 0:
         tickers = tickers[:max_universe_stocks]
     return sanitize_for_json(_get_price_cache_status(tickers=tickers, interval=interval))
-
-
-@mcp.tool("warm_price_history_cache")
-def warm_price_history_cache(
-    universe: str = "full_nse",
-    start_date: str | None = None,
-    interval: str = "1d",
-    max_universe_stocks: int | None = None,
-    chunk_size: int = 80,
-    retry_attempts: int = 2,
-) -> dict[str, Any]:
-    """Incrementally fill price_history_cache for a universe of tickers.
-
-    This is the same incremental engine (fill_price_cache_for_universe) the sidebar's
-    "Refresh price cache" button and the daily_refresh CLI use — already-current tickers
-    are skipped, not re-fetched; only missing/new dates get pulled. Pass universe="all" for
-    every ticker in instrument_master (no exchange/market predicate — the fullest coverage).
-    start_date overrides PRICE_HISTORY_START_DATE (from .env) as the backfill floor for this
-    run only.
-    """
-    tickers = _list_all_instrument_master_tickers() if universe == "all" else _list_instrument_master_tickers(universe)
-    if max_universe_stocks is not None and max_universe_stocks > 0:
-        tickers = tickers[:max_universe_stocks]
-    result = _fill_price_cache_for_universe(
-        tickers,
-        interval=interval,
-        start_date=start_date,
-        chunk_size=chunk_size,
-        retry_attempts=retry_attempts,
-    )
-    result["universe"] = universe
-    result["universe_stock_count"] = len(tickers)
-    return sanitize_for_json(result)
 
 
 @mcp.tool("list_sector_definitions")
@@ -1019,9 +943,10 @@ def get_price_history(
     """Return recent OHLCV price rows, optionally enriched with technical indicators.
 
     Prices are always served from price_history_cache (force_refresh is accepted for
-    tool-call schema compatibility but has no effect). If nothing is cached for this
-    ticker/period, populate the cache first via the warm_price_history_cache tool, the
-    daily_refresh CLI, or the sidebar's "Refresh price cache" button in the Streamlit app.
+    tool-call schema compatibility but has no effect). MCP has no tool that fetches price
+    history live — if nothing is cached for this ticker/period, populate the cache first via
+    the daily_refresh CLI/cron or the sidebar's "Refresh price cache" button in the Streamlit
+    app (check get_price_cache_status to see current coverage).
     """
     effective_period = period or settings.default_period
     effective_interval = interval or settings.default_interval

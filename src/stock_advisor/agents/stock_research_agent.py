@@ -62,8 +62,8 @@ def run_stock_research_agent(
 
     force_refresh_prices is accepted for tool-call schema compatibility but has no
     effect: price history is always served from price_history_cache. Populate the
-    cache from the sidebar's "Refresh price cache" button, the daily_refresh CLI, or
-    the warm_price_history_cache MCP tool.
+    cache from the sidebar's "Refresh price cache" button or the daily_refresh
+    CLI/cron — no MCP tool ever fetches live.
     """
     normalized = _normalize_ticker(ticker)
     state: StockResearchState = {

@@ -127,9 +127,26 @@ def test_store_price_history_backward_fill_does_not_regress_latest_date(tmp_path
     assert price_data_date == "2026-08-20"
 
 
+def _no_bhavcopy_data(tickers, trade_date):
+    """Stand-in for get_exchange_eod_rows_for_date simulating bhavcopy having nothing for any
+    requested ticker on any date -- keeps pre-existing Yahoo-only tests isolated from real
+    network calls, without changing their original intent (Yahoo does all the work)."""
+    return {}
+
+
+def _mock_bhavcopy_source(monkeypatch, *, row_fn=_no_bhavcopy_data, connectivity_ok=True):
+    """Isolate every path that reaches the real NSE/BSE bhavcopy fetchers (the priority pass
+    and/or the fallback pass inside fill_price_cache_for_universe) from the network. row_fn
+    simulates get_exchange_eod_rows_for_date's ticker-filtered result; connectivity_ok simulates
+    bhavcopy_fetch_succeeded_for_date's day-level "was the exchange reachable" signal."""
+    monkeypatch.setattr(market_data, "get_exchange_eod_rows_for_date", row_fn)
+    monkeypatch.setattr(market_data, "bhavcopy_fetch_succeeded_for_date", lambda trade_date: connectivity_ok)
+
+
 def test_fill_price_cache_for_universe_classifies_new_ticker_as_full_fetch(tmp_path, monkeypatch):
     monkeypatch.setattr(market_data.settings, "db_path", tmp_path / "cache.sqlite")
     monkeypatch.setattr(market_data.settings, "price_history_start_date", "2024-01-01")
+    _mock_bhavcopy_source(monkeypatch)
     calls = []
     monkeypatch.setattr(
         market_data,
@@ -148,6 +165,7 @@ def test_fill_price_cache_for_universe_classifies_new_ticker_as_full_fetch(tmp_p
 def test_fill_price_cache_for_universe_skips_up_to_date_ticker(tmp_path, monkeypatch):
     monkeypatch.setattr(market_data.settings, "db_path", tmp_path / "cache.sqlite")
     monkeypatch.setattr(market_data.settings, "price_history_start_date", "2024-01-01")
+    _mock_bhavcopy_source(monkeypatch)
     today = market_data._current_market_datetime().date().isoformat()
     market_data._store_price_history("UPTODATE.NS", "1d", _price_frame(["2024-01-01", today]))
 
@@ -162,6 +180,92 @@ def test_fill_price_cache_for_universe_skips_up_to_date_ticker(tmp_path, monkeyp
 
     assert not calls
     assert result["skipped_up_to_date_count"] == 1
+
+
+def test_fill_price_cache_for_universe_bhavcopy_fallback_recovers_yahoo_failure(tmp_path, monkeypatch):
+    """A ticker Yahoo can't fetch (e.g. an SME/illiquid listing) gets recovered by the bhavcopy
+    fallback pass instead of ending up in failed_tickers. The priority pass is disabled here
+    (window=0) to isolate the fallback pass specifically -- otherwise the priority pass would
+    recover this ticker itself before classification ever runs, since both use the same mocked
+    bhavcopy source."""
+    monkeypatch.setattr(market_data.settings, "db_path", tmp_path / "cache.sqlite")
+    monkeypatch.setattr(market_data.settings, "price_history_start_date", "2024-01-01")
+    monkeypatch.setattr(market_data.settings, "bhavcopy_priority_window_days", 0)
+    monkeypatch.setattr(market_data, "_fetch_and_store_range", lambda chunk, start, end, interval: {})
+
+    def _bhavcopy_has_data(tickers, trade_date):
+        frame = _price_frame([trade_date.isoformat()])
+        frame.attrs["provider"] = "bse_bhavcopy"
+        return {ticker: frame for ticker in tickers}
+
+    _mock_bhavcopy_source(monkeypatch, row_fn=_bhavcopy_has_data)
+
+    result = market_data.fill_price_cache_for_universe(["544412.BO"], retry_attempts=0)
+
+    assert result["bhavcopy_fallback_recovered_count"] == 1
+    assert result["dormant_marked_count"] == 0
+    assert "544412.BO" not in result["failed_tickers"]
+    with market_data._price_cache_connection() as conn:
+        active = conn.execute(
+            "SELECT active FROM instrument_master WHERE ticker = '544412.BO'"
+        ).fetchone()["active"]
+    assert active in (1, None)
+
+
+def test_fill_price_cache_for_universe_marks_dormant_when_bhavcopy_also_empty(tmp_path, monkeypatch):
+    """A ticker with zero trades on Yahoo AND across the full bhavcopy day-walk gets
+    instrument_master.active set to 0 and is removed from failed_tickers."""
+    monkeypatch.setattr(market_data.settings, "db_path", tmp_path / "cache.sqlite")
+    monkeypatch.setattr(market_data.settings, "price_history_start_date", "2024-01-01")
+    monkeypatch.setattr(market_data, "_fetch_and_store_range", lambda chunk, start, end, interval: {})
+    _mock_bhavcopy_source(monkeypatch, connectivity_ok=True)
+
+    with market_data._price_cache_connection() as conn:
+        market_data._ensure_price_cache_schema(conn)
+        conn.execute("INSERT INTO instrument_master (ticker, market, active) VALUES ('DEAD.BO', 'IN', 1)")
+        conn.commit()
+
+    result = market_data.fill_price_cache_for_universe(["DEAD.BO"], retry_attempts=0)
+
+    assert result["dormant_marked_count"] == 1
+    assert "DEAD.BO" in result["dormant_tickers"]
+    assert "DEAD.BO" not in result["failed_tickers"]
+    with market_data._price_cache_connection() as conn:
+        active = conn.execute("SELECT active FROM instrument_master WHERE ticker = 'DEAD.BO'").fetchone()["active"]
+    assert active == 0
+
+
+def test_fill_price_cache_for_universe_outage_guard_skips_dormancy_marking(tmp_path, monkeypatch):
+    """If the bhavcopy day-walk itself came back mostly empty (simulating an exchange-side
+    outage rather than genuine zero-trade tickers), nothing gets marked dormant."""
+    monkeypatch.setattr(market_data.settings, "db_path", tmp_path / "cache.sqlite")
+    monkeypatch.setattr(market_data.settings, "price_history_start_date", "2024-01-01")
+    monkeypatch.setattr(market_data.settings, "min_bhavcopy_coverage_pct", 80.0)
+    monkeypatch.setattr(market_data, "_fetch_and_store_range", lambda chunk, start, end, interval: {})
+
+    def _fake_backfill(tickers, *, start_date, end_date=None, interval="1d", progress_callback=None):
+        # Simulates an outage: almost no scanned days actually returned bhavcopy data.
+        return {
+            "requested_ticker_count": len(tickers),
+            "trading_days_scanned": 100,
+            "trading_days_with_bhavcopy_data": 5,
+            "tickers_with_data_count": 0,
+        }
+
+    monkeypatch.setattr(market_data, "backfill_bhavcopy_history", _fake_backfill)
+
+    with market_data._price_cache_connection() as conn:
+        market_data._ensure_price_cache_schema(conn)
+        conn.execute("INSERT INTO instrument_master (ticker, market, active) VALUES ('OUTAGE.BO', 'IN', 1)")
+        conn.commit()
+
+    result = market_data.fill_price_cache_for_universe(["OUTAGE.BO"], retry_attempts=0)
+
+    assert result["dormant_marked_count"] == 0
+    assert "OUTAGE.BO" in result["failed_tickers"]
+    with market_data._price_cache_connection() as conn:
+        active = conn.execute("SELECT active FROM instrument_master WHERE ticker = 'OUTAGE.BO'").fetchone()["active"]
+    assert active == 1
 
 
 def test_fundamentals_merge_sec_facts(monkeypatch):
