@@ -1,3 +1,5 @@
+import pytest
+
 from stock_advisor.data import universe
 
 
@@ -215,6 +217,113 @@ def test_dhan_scrip_master_to_universe_rows_builds_nse_bse_equity_tickers():
     tickers = {row["ticker"] for row in result}
     assert tickers == {"RELIANCE.NS", "500325.BO"}
     assert {row["exchange"] for row in result} == {"NSE", "BSE"}
+
+
+class _FakeArchiveResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+def test_fetch_nse_total_market_archive_rows_maps_sector_via_normalization(monkeypatch):
+    """The archive CSV's "Industry" column is sector-level (e.g. "Oil Gas & Consumable Fuels")
+    -- must map through _normalize_sector_label onto the same labels the rest of the app uses
+    (e.g. "Oil, Gas & Consumable fuels"), and populate industry/basic_industry with the same
+    value since this source has no finer per-stock granularity."""
+    csv_text = (
+        "Company Name,Industry,Symbol,Series,ISIN Code\n"
+        "Reliance Industries Ltd.,Oil Gas & Consumable Fuels,RELIANCE,EQ,INE002A01018\n"
+        "Bajaj Auto Ltd.,Automobile and Auto Components,BAJAJ-AUTO,EQ,INE917I01010\n"
+    )
+    monkeypatch.setattr(universe.requests, "get", lambda url, headers=None, timeout=None: _FakeArchiveResponse(csv_text))
+
+    rows = universe._fetch_nse_total_market_archive_rows()
+
+    assert len(rows) == 2
+    by_symbol = {row["symbol"]: row for row in rows}
+    assert by_symbol["RELIANCE"]["ticker"] == "RELIANCE.NS"
+    assert by_symbol["RELIANCE"]["sector"] == "Oil, Gas & Consumable fuels"
+    assert by_symbol["RELIANCE"]["industry"] == "Oil, Gas & Consumable fuels"
+    assert by_symbol["RELIANCE"]["basic_industry"] == "Oil, Gas & Consumable fuels"
+    assert by_symbol["BAJAJ-AUTO"]["sector"] == "Auto"
+    assert by_symbol["RELIANCE"]["active"] is True
+    assert by_symbol["RELIANCE"]["source"] == "nse_total_market_archive_csv"
+
+
+def test_refresh_stock_universe_uses_archive_and_round_trips_unclassified_free(tmp_path, monkeypatch):
+    csv_text = (
+        "Company Name,Industry,Symbol,Series,ISIN Code\n"
+        "Reliance Industries Ltd.,Oil Gas & Consumable Fuels,RELIANCE,EQ,INE002A01018\n"
+    )
+    monkeypatch.setattr(universe.requests, "get", lambda url, headers=None, timeout=None: _FakeArchiveResponse(csv_text))
+    monkeypatch.setattr(universe, "_sync_instrument_master_safely", lambda *a, **k: None)
+
+    universe_path = tmp_path / "nse_universe.csv"
+    result = universe.refresh_stock_universe(index_name="NIFTY TOTAL MARKET", path=universe_path)
+
+    assert result["count"] == 1
+    loaded = universe.load_stock_universe(universe="broad", path=universe_path)
+    assert len(loaded) == 1
+    assert (loaded["sector"] == "Unclassified").sum() == 0
+
+
+def test_refresh_stock_universe_rejects_unsupported_index_name():
+    with pytest.raises(ValueError, match="NIFTY TOTAL MARKET"):
+        universe.refresh_stock_universe(index_name="NIFTY BANK")
+
+
+def test_apply_live_metrics_overlay_overrides_when_available(monkeypatch):
+    import stock_advisor.data.market_data as market_data
+
+    def _fake_get_live_metrics(tickers):
+        return {
+            "AAA.NS": {
+                "last_price": 999.0, "year_high": None, "year_low": None, "near_52w_high_pct": None,
+                "return_7d_pct": 5.0, "return_30d_pct": 10.0, "return_90d_pct": None,
+                "return_180d_pct": None, "return_365d_pct": None,
+            },
+        }
+
+    monkeypatch.setattr(market_data, "get_live_metrics_for_tickers", _fake_get_live_metrics)
+
+    df = universe.pd.DataFrame(
+        [
+            {
+                "ticker": "AAA.NS", "last_price": 1.0, "year_high": None, "year_low": None, "near_52w_high_pct": None,
+                "return_7d_pct": None, "return_30d_pct": 1.0, "return_90d_pct": None, "return_180d_pct": None, "return_365d_pct": None,
+            },
+            {
+                "ticker": "BBB.NS", "last_price": 2.0, "year_high": None, "year_low": None, "near_52w_high_pct": None,
+                "return_7d_pct": None, "return_30d_pct": 2.0, "return_90d_pct": None, "return_180d_pct": None, "return_365d_pct": None,
+            },
+        ]
+    )
+
+    out = universe._apply_live_metrics_overlay(df)
+
+    aaa = out[out["ticker"] == "AAA.NS"].iloc[0]
+    bbb = out[out["ticker"] == "BBB.NS"].iloc[0]
+    assert aaa["last_price"] == 999.0
+    assert aaa["return_7d_pct"] == 5.0
+    assert aaa["return_30d_pct"] == 10.0
+    assert bbb["last_price"] == 2.0  # no live_metrics row for BBB -> untouched
+    assert bbb["return_30d_pct"] == 2.0
+
+
+def test_apply_live_metrics_overlay_falls_back_on_error(monkeypatch):
+    import stock_advisor.data.market_data as market_data
+
+    def _raise(tickers):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(market_data, "get_live_metrics_for_tickers", _raise)
+
+    df = universe.pd.DataFrame([{"ticker": "AAA.NS", "return_30d_pct": 1.0}])
+    out = universe._apply_live_metrics_overlay(df)
+
+    assert out["return_30d_pct"].iloc[0] == 1.0  # unchanged, no crash
 
 
 def test_merge_exchange_rows_dedupes_dual_listed_by_isin():

@@ -25,6 +25,14 @@ DEFAULT_FULL_BSE_UNIVERSE_PATH = PROJECT_ROOT / "data" / "bse_full_universe.csv"
 DEFAULT_ALL_INDIA_UNIVERSE_PATH = PROJECT_ROOT / "data" / "india_full_universe.csv"
 DEFAULT_SECTOR_TAXONOMY_PATH = PROJECT_ROOT / "data" / "sectors"
 NSE_INDEX_API = "https://www.nseindia.com/api/equity-stockIndices?index={index_name}"
+# NSE_INDEX_API above is confirmed dead (every request returns a branded "Resource not found"
+# page, not a transient block) -- retired at some point around 2026-05-31, which is why
+# nse_universe.csv silently stopped refreshing then. NSE still publishes the same index
+# constituent data as a free, static, no-auth CSV archive (same nsearchives.nseindia.com family
+# already used for bhavcopy and daily index-close archives -- see nse_indices.py). Only "NIFTY
+# TOTAL MARKET" has a confirmed working archive filename; other index names aren't supported here.
+NSE_TOTAL_MARKET_ARCHIVE_URL = "https://archives.nseindia.com/content/indices/ind_niftytotalmarket_list.csv"
+NSE_ARCHIVE_HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*", "Referer": "https://www.nseindia.com/"}
 NSE_EQUITY_MASTER_CSV = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 NSE_QUOTE_EQUITY_API = "https://www.nseindia.com/api/quote-equity?symbol={symbol}"
 NSE_HOME = "https://www.nseindia.com"
@@ -197,7 +205,10 @@ UNIVERSE_COLUMNS = [
     "year_high",
     "year_low",
     "near_52w_high_pct",
+    "return_7d_pct",
     "return_30d_pct",
+    "return_90d_pct",
+    "return_180d_pct",
     "return_365d_pct",
     "refreshed_at",
     "exchange",
@@ -323,7 +334,11 @@ def load_stock_universe(
             df[column] = None
     df = df[UNIVERSE_COLUMNS].copy()
     df["active"] = df["active"].map(_to_bool)
-    for column in ["free_float_market_cap", "last_price", "year_high", "year_low", "near_52w_high_pct", "return_30d_pct", "return_365d_pct"]:
+    numeric_columns = [
+        "free_float_market_cap", "last_price", "year_high", "year_low", "near_52w_high_pct",
+        "return_7d_pct", "return_30d_pct", "return_90d_pct", "return_180d_pct", "return_365d_pct",
+    ]
+    for column in numeric_columns:
         df[column] = pd.to_numeric(df[column], errors="coerce")
     df = df[df["active"] == True].copy()  # noqa: E712
     df = _ensure_exchange_metadata(df)
@@ -331,6 +346,7 @@ def load_stock_universe(
     df = _apply_sector_csv_taxonomy(df, restrict_to_taxonomy=normalized == "full_nse")
     if normalized == "full_nse":
         df = _apply_nse_total_market_cap_overlay(df)
+    df = _apply_live_metrics_overlay(df)
     if max_stocks is not None:
         df = df.head(max(0, int(max_stocks))).copy()
     return df
@@ -454,7 +470,10 @@ def _stock_constituent_rows(df: pd.DataFrame) -> list[dict[str, Any]]:
         "year_high",
         "year_low",
         "near_52w_high_pct",
+        "return_7d_pct",
         "return_30d_pct",
+        "return_90d_pct",
+        "return_180d_pct",
         "return_365d_pct",
         "exchange",
         "security_id",
@@ -494,10 +513,22 @@ def refresh_stock_universe(
     index_name: str = DEFAULT_NSE_INDEX_NAME,
     path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Fetch the free NSE index constituent snapshot and persist it as CSV."""
+    """Fetch the free NSE index constituent snapshot and persist it as CSV.
+
+    Only "NIFTY TOTAL MARKET" is supported -- the bulk JSON API this used to call for any index
+    name is confirmed retired (every request 404s with NSE's own "Resource not found" page), and
+    a working free replacement is only confirmed for the static Total Market archive file (see
+    NSE_TOTAL_MARKET_ARCHIVE_URL above). A different index_name raises rather than silently
+    attempting a call that's confirmed to always fail.
+    """
+    if str(index_name or "").strip().upper() != "NIFTY TOTAL MARKET":
+        raise ValueError(
+            f"refresh_stock_universe only supports index_name='NIFTY TOTAL MARKET' -- NSE's bulk "
+            f"equity-stockIndices API (which used to serve any index name) is retired, and no "
+            f"working free archive source is confirmed for {index_name!r}."
+        )
     universe_path = Path(path) if path is not None else DEFAULT_UNIVERSE_PATH
-    payload = _fetch_nse_index_json(index_name)
-    rows = _nse_payload_to_universe_rows(payload, index_name=index_name)
+    rows = _fetch_nse_total_market_archive_rows()
     universe_path.parent.mkdir(parents=True, exist_ok=True)
     with universe_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=UNIVERSE_COLUMNS)
@@ -511,6 +542,52 @@ def refresh_stock_universe(
     }
     _sync_instrument_master_safely("refresh_stock_universe")
     return result
+
+
+def _fetch_nse_total_market_archive_rows() -> list[dict[str, Any]]:
+    """Fetch NIFTY TOTAL MARKET constituents from NSE's free static CSV archive.
+
+    Plain, unauthenticated GET -- confirmed live to need no session/cookies, unlike the retired
+    JSON API this replaces. Only gives one classification granularity (the CSV's "Industry"
+    column is sector-level, e.g. "Automobile and Auto Components", not a finer per-stock
+    sub-industry) -- industry/basic_industry are set to the same resolved value here;
+    load_stock_universe's existing local-taxonomy overlay refines them further per-symbol where a
+    match exists, same as it already does for every universe today.
+    """
+    response = requests.get(NSE_TOTAL_MARKET_ARCHIVE_URL, headers=NSE_ARCHIVE_HEADERS, timeout=20)
+    response.raise_for_status()
+    refreshed_at = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for item in csv.DictReader(response.text.splitlines()):
+        symbol = str(item.get("Symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        sector = _normalize_sector_label(item.get("Industry"))
+        rows.append(
+            {
+                "ticker": f"{symbol}.NS",
+                "symbol": symbol,
+                "name": str(item.get("Company Name") or symbol).strip(),
+                "isin": str(item.get("ISIN Code") or "").strip(),
+                "sector": sector,
+                "industry": sector,
+                "basic_industry": sector,
+                "index_name": "NIFTY TOTAL MARKET",
+                "source": "nse_total_market_archive_csv",
+                "active": True,
+                "series": str(item.get("Series") or "").strip().upper(),
+                "free_float_market_cap": None,
+                "last_price": None,
+                "year_high": None,
+                "year_low": None,
+                "near_52w_high_pct": None,
+                "return_30d_pct": None,
+                "return_365d_pct": None,
+                "refreshed_at": refreshed_at,
+                "data_quality": "classified_by_nse_total_market_archive",
+            }
+        )
+    return rows
 
 
 def refresh_full_stock_universe(
@@ -1164,6 +1241,54 @@ def _apply_nse_total_market_cap_overlay(df: pd.DataFrame) -> pd.DataFrame:
     missing_cap = out["free_float_market_cap"].isna()
     out.loc[missing_cap, "free_float_market_cap"] = out.loc[missing_cap, "symbol"].map(cap_by_symbol)
     return out[UNIVERSE_COLUMNS].reset_index(drop=True)
+
+
+_LIVE_METRICS_OVERLAY_COLUMNS = [
+    "last_price", "year_high", "year_low", "near_52w_high_pct",
+    "return_7d_pct", "return_30d_pct", "return_90d_pct", "return_180d_pct", "return_365d_pct",
+]
+
+
+def _apply_live_metrics_overlay(df: pd.DataFrame) -> pd.DataFrame:
+    """Overlay price/return metrics from the DB's live_metrics table (price_history_cache
+    -derived -- see market_data._refresh_live_metrics) on top of whatever the CSV had.
+
+    live_metrics is the single source of truth for these fields app-wide; the CSV's own values
+    (NSE-JSON-sourced where available at all, stale between universe refreshes, and never present
+    for Dhan-sourced full_bse/all_india rows) are only ever a fallback for a ticker with no
+    live_metrics row yet. Read-time only -- never written back to the CSV file.
+
+    Deferred import: market_data.py imports this module (for build_stock_master_frame), so
+    importing market_data at module scope here would be circular -- same workaround already used
+    by _sync_instrument_master_safely.
+    """
+    if df.empty or "ticker" not in df.columns:
+        return df
+    from stock_advisor.data.market_data import get_live_metrics_for_tickers
+
+    try:
+        metrics_by_ticker = get_live_metrics_for_tickers(df["ticker"].tolist())
+    except Exception as exc:  # noqa: BLE001
+        logger.info("live_metrics overlay unavailable: %s", exc)
+        return df
+    if not metrics_by_ticker:
+        return df
+
+    out = df.copy()
+    for column in _LIVE_METRICS_OVERLAY_COLUMNS:
+        if column not in out.columns:
+            out[column] = None
+        # All overlay columns are numeric -- coerce through pd.to_numeric (turns a live_metrics
+        # row's SQL NULL, read back as Python None, into NaN) before assigning. A float64 column
+        # rejects a raw None outright (pandas >=2 raises LossySetitemError/TypeError on that),
+        # which is exactly what a mix of None and real floats from metrics_by_ticker.get(...)
+        # produces otherwise.
+        overlay_values = pd.to_numeric(
+            out["ticker"].map(lambda t: metrics_by_ticker.get(t, {}).get(column)), errors="coerce"
+        )
+        has_overlay = out["ticker"].isin(metrics_by_ticker)
+        out.loc[has_overlay, column] = overlay_values[has_overlay]
+    return out
 
 
 def _dedupe_sector_taxonomy(df: pd.DataFrame) -> pd.DataFrame:
