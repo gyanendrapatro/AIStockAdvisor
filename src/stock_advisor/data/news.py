@@ -79,9 +79,13 @@ def get_news(ticker: str, limit: int = 5) -> list[dict[str, Any]]:
 
 
 def _news_cache_connection() -> sqlite3.Connection:
+    # Same database file market_data.py's price cache lives in, which now has several concurrent
+    # writers -- see _price_cache_connection's comment for why timeout/WAL both matter here too.
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(settings.db_path)
+    conn = sqlite3.connect(settings.db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 

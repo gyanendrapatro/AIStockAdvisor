@@ -1,22 +1,35 @@
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta
+import csv
 import logging
 import os
 import sqlite3
+import time as time_module
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 import yfinance as yf
 
-from stock_advisor.config.settings import settings
+from stock_advisor.config.settings import PROJECT_ROOT, settings
 from stock_advisor.data.exchange_eod import (
     bhavcopy_fetch_succeeded_for_date,
     get_exchange_eod_rows_for_date,
     get_latest_exchange_eod_rows,
+)
+from stock_advisor.data.nse_shareholding import (
+    build_shareholding_index,
+    default_sme_lookback_from_date,
+    extract_total_paid_up_shares,
+    fetch_shareholding_master,
+    nse_session,
+)
+from stock_advisor.data.screener import (
+    DEFAULT_REQUEST_DELAY_SECONDS as SCREENER_DEFAULT_REQUEST_DELAY_SECONDS,
+    fetch_screener_shares_outstanding,
 )
 from stock_advisor.data.sec_edgar import get_sec_fundamentals
 from stock_advisor.data.ownership import get_ownership_fundamentals
@@ -150,12 +163,15 @@ def _load_cached_price_history(ticker: str, period: str, interval: str) -> pd.Da
     return df.drop(columns=["provider", "fetched_at"], errors="ignore")
 
 
-def _store_price_history(ticker: str, interval: str, df: pd.DataFrame) -> None:
+def _store_price_history(ticker: str, interval: str, df: pd.DataFrame) -> bool:
+    """Persist a fetched price-history batch. Returns True iff this call refreshed live_metrics
+    for the ticker (i.e. the batch reached a new latest_date) -- used by callers up the stack to
+    surface a live "live metrics updated for N tickers" count in the sidebar during a refresh."""
     if df.empty or not _price_cache_allowed(interval):
-        return
+        return False
     required = {"date", "open", "high", "low", "close"}
     if not required.issubset(df.columns):
-        return
+        return False
 
     ticker_key = _cache_ticker(ticker)
     provider = str(df.attrs.get("provider") or "unknown")
@@ -170,8 +186,20 @@ def _store_price_history(ticker: str, interval: str, df: pd.DataFrame) -> None:
     if has_turnover:
         cache_df["turnover"] = pd.to_numeric(cache_df["turnover"], errors="coerce")
     cache_df = cache_df.dropna(subset=["date", "open", "high", "low", "close"])
+    if provider == "yfinance_batch":
+        # yf.download regularly carries a thinly-traded security's last known close forward as a
+        # synthetic zero-volume "close" for every calendar day it doesn't actually trade, instead
+        # of returning nothing -- confirmed directly against bhavcopy: e.g. EDUCOMP.NS genuinely
+        # traded (bhavcopy, real volume) on 2026-08-24, and Yahoo served the identical 0.88 close
+        # with volume=0 on every surrounding day. Treating that as a real fetch silently advances
+        # latest_date forever (masking genuine staleness from the dormancy check) and pollutes
+        # price_history_cache with fabricated flat rows that feed straight into
+        # return_30d_pct/return_365d_pct. Bhavcopy is exempt -- its small zero-volume rate looks
+        # like genuine auction/corporate-action rows from the authoritative exchange record, not
+        # fabrication.
+        cache_df = cache_df[cache_df["volume"].fillna(0) > 0]
     if cache_df.empty:
-        return
+        return False
 
     rows = [
         (
@@ -231,12 +259,24 @@ def _store_price_history(ticker: str, interval: str, df: pd.DataFrame) -> None:
             ).fetchone()[0]
             conn.execute(
                 """
-                INSERT OR REPLACE INTO price_cache_meta
+                INSERT INTO price_cache_meta
                 (ticker_id, interval, max_period_days, latest_date, earliest_date, provider, fetched_at, row_count)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker_id, interval) DO UPDATE SET
+                    max_period_days=excluded.max_period_days,
+                    latest_date=excluded.latest_date,
+                    earliest_date=excluded.earliest_date,
+                    provider=excluded.provider,
+                    fetched_at=excluded.fetched_at,
+                    row_count=excluded.row_count
                 """,
                 (ticker_id, interval, max_period_days, latest_date, earliest_date, provider, fetched_at, int(row_count or 0)),
             )
+            # Deliberately NOT touching backfill_exhausted_start_date here (unlike an
+            # INSERT OR REPLACE, which would silently wipe it back to NULL on every write) --
+            # only _mark_backfill_exhausted sets it, and only fill_price_cache_for_universe's
+            # classification step reads it. A plain price write (this function) must never
+            # invalidate a confirmed "nothing exists before this date" finding.
 
             # price_data/live_metrics reflect this batch's OWN latest row, not the all-time latest_date
             # above — their own ON CONFLICT ... WHERE guards below already refuse to regress if this
@@ -266,12 +306,15 @@ def _store_price_history(ticker: str, interval: str, df: pd.DataFrame) -> None:
 
             if interval == "1d" and batch_max_date == latest_date:
                 _refresh_live_metrics(conn, ticker_id, interval, batch_max_date, float(latest_row[5]))
+                return True
     except Exception as exc:  # noqa: BLE001
         logger.debug("Price cache store failed for %s: %s", ticker_key, exc)
+        return False
+    return False
 
 
 def _refresh_live_metrics(conn: sqlite3.Connection, ticker_id: int, interval: str, latest_date: str, last_price: float) -> None:
-    """Recompute year_high/year_low/near_52w_high_pct/return_30d_pct/return_365d_pct for a
+    """Recompute year_high/year_low/near_52w_high_pct/return_{7,30,90,180,365}d_pct for a
     ticker from price_history_cache (which already has whatever was just written, plus any
     older history) and upsert into live_metrics. Cheap: a handful of indexed range queries."""
     window = conn.execute(
@@ -304,21 +347,64 @@ def _refresh_live_metrics(conn: sqlite3.Connection, ticker_id: int, interval: st
             return None
         return round(100 * (last_price - prior_close) / prior_close, 4)
 
+    return_7d_pct = _return_pct(7)
     return_30d_pct = _return_pct(30)
+    return_90d_pct = _return_pct(90)
+    return_180d_pct = _return_pct(180)
     return_365d_pct = _return_pct(365)
     computed_at = _current_market_datetime().isoformat()
     conn.execute(
         """
-        INSERT INTO live_metrics (ticker_id, last_price, year_high, year_low, near_52w_high_pct, return_30d_pct, return_365d_pct, as_of_date, computed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO live_metrics
+        (ticker_id, last_price, year_high, year_low, near_52w_high_pct,
+         return_7d_pct, return_30d_pct, return_90d_pct, return_180d_pct, return_365d_pct,
+         as_of_date, computed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(ticker_id) DO UPDATE SET
             last_price=excluded.last_price, year_high=excluded.year_high, year_low=excluded.year_low,
-            near_52w_high_pct=excluded.near_52w_high_pct, return_30d_pct=excluded.return_30d_pct,
-            return_365d_pct=excluded.return_365d_pct, as_of_date=excluded.as_of_date, computed_at=excluded.computed_at
+            near_52w_high_pct=excluded.near_52w_high_pct,
+            return_7d_pct=excluded.return_7d_pct, return_30d_pct=excluded.return_30d_pct,
+            return_90d_pct=excluded.return_90d_pct, return_180d_pct=excluded.return_180d_pct,
+            return_365d_pct=excluded.return_365d_pct,
+            as_of_date=excluded.as_of_date, computed_at=excluded.computed_at
         WHERE excluded.as_of_date >= COALESCE(live_metrics.as_of_date, '')
         """,
-        (ticker_id, last_price, year_high, year_low, near_52w_high_pct, return_30d_pct, return_365d_pct, latest_date, computed_at),
+        (
+            ticker_id, last_price, year_high, year_low, near_52w_high_pct,
+            return_7d_pct, return_30d_pct, return_90d_pct, return_180d_pct, return_365d_pct,
+            latest_date, computed_at,
+        ),
     )
+
+
+def get_live_metrics_for_tickers(tickers: list[str] | tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    """Bulk-read live_metrics (price_history_cache-derived last_price/year_high/year_low/
+    near_52w_high_pct/return_{7,30,90,180,365}d_pct) for the given tickers, keyed by ticker.
+
+    This is THE read path for these metrics -- live_metrics is the only place they're ever
+    written (see _refresh_live_metrics), computed purely from price_history_cache. Used by
+    universe._apply_live_metrics_overlay so the CSV-based universe views display the same
+    cache-derived numbers as everything else, instead of their own separately-sourced (or
+    entirely absent) copies. A ticker with no live_metrics row yet is simply omitted from the
+    result -- callers should leave whatever they already had for it untouched.
+    """
+    unique = list(dict.fromkeys(_cache_ticker(t) for t in tickers if _cache_ticker(t)))
+    if not unique:
+        return {}
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        placeholders = ",".join("?" for _ in unique)
+        rows = conn.execute(
+            f"""
+            SELECT im.ticker AS ticker, lm.last_price, lm.year_high, lm.year_low, lm.near_52w_high_pct,
+                   lm.return_7d_pct, lm.return_30d_pct, lm.return_90d_pct, lm.return_180d_pct, lm.return_365d_pct
+            FROM instrument_master im
+            JOIN live_metrics lm ON lm.ticker_id = im.ticker_id
+            WHERE im.ticker IN ({placeholders})
+            """,
+            unique,
+        ).fetchall()
+    return {row["ticker"]: {key: row[key] for key in row.keys() if key != "ticker"} for row in rows}
 
 
 def _overlay_exchange_latest_rows(frames: dict[str, pd.DataFrame], *, interval: str) -> dict[str, pd.DataFrame]:
@@ -394,9 +480,20 @@ def _price_cache_allowed(interval: str) -> bool:
 
 
 def _price_cache_connection() -> sqlite3.Connection:
+    # This app now has several concurrent writers against the same file at once (a price-cache
+    # refresh, a shares-outstanding backfill, market-cap recompute, an ad-hoc query -- all opening
+    # their own short-lived connection via this same factory). The default rollback-journal mode
+    # takes an exclusive lock for the whole duration of any write, and sqlite3.connect()'s default
+    # 5s busy-timeout is too short once real work (not just a quick UPDATE) is what's holding that
+    # lock -- that combination is exactly what "database is locked" means. WAL mode lets readers
+    # and a single writer proceed without blocking each other (a one-time, persisted-in-the-file
+    # setting -- cheap to re-issue on every connect once already WAL), and a much longer
+    # busy_timeout makes a connection wait out a genuinely busy writer instead of failing outright.
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(settings.db_path)
+    conn = sqlite3.connect(settings.db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -442,6 +539,8 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
         """
     )
     _migrate_security_classification_split(conn)
+    _migrate_security_classification_iics_columns(conn)
+    _load_iics_classification_seed_if_needed(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS price_data (
@@ -463,11 +562,15 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
             ticker_id INTEGER PRIMARY KEY REFERENCES instrument_master(ticker_id),
             market_cap REAL,
             free_float_market_cap REAL,
+            shares_outstanding REAL,
+            shares_outstanding_source TEXT,
+            shares_outstanding_fetched_at TEXT,
             date TEXT,
             fetched_at TEXT
         )
         """
     )
+    _migrate_market_cap_columns(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS live_metrics (
@@ -476,13 +579,17 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
             year_high REAL,
             year_low REAL,
             near_52w_high_pct REAL,
+            return_7d_pct REAL,
             return_30d_pct REAL,
+            return_90d_pct REAL,
+            return_180d_pct REAL,
             return_365d_pct REAL,
             as_of_date TEXT,
             computed_at TEXT
         )
         """
     )
+    _migrate_live_metrics_columns(conn)
     _migrate_legacy_ticker_schema(conn)
     conn.execute(
         """
@@ -509,6 +616,7 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
             max_period_days INTEGER NOT NULL,
             latest_date TEXT,
             earliest_date TEXT,
+            backfill_exhausted_start_date TEXT,
             provider TEXT,
             fetched_at TEXT NOT NULL,
             row_count INTEGER NOT NULL,
@@ -520,15 +628,51 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_price_history_cache_lookup ON price_history_cache (ticker_id, interval, date)")
 
 
+def _migrate_market_cap_columns(conn: sqlite3.Connection) -> None:
+    """Add shares_outstanding/shares_outstanding_source/shares_outstanding_fetched_at to
+    market_cap (needed by recompute_market_cap_from_shares_outstanding). No-ops once already
+    migrated. shares_outstanding_source ("nse_xbrl" or "screener_derived") lets the NSE backfill
+    pass safely upgrade a screener-derived figure without a later screener re-run downgrading a
+    more authoritative NSE one."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(market_cap)")}
+    if not cols:
+        return  # table doesn't exist yet (handled by the CREATE TABLE IF NOT EXISTS above)
+    if "shares_outstanding" not in cols:
+        conn.execute("ALTER TABLE market_cap ADD COLUMN shares_outstanding REAL")
+    if "shares_outstanding_source" not in cols:
+        conn.execute("ALTER TABLE market_cap ADD COLUMN shares_outstanding_source TEXT")
+    if "shares_outstanding_fetched_at" not in cols:
+        conn.execute("ALTER TABLE market_cap ADD COLUMN shares_outstanding_fetched_at TEXT")
+    conn.commit()
+
+
+def _migrate_live_metrics_columns(conn: sqlite3.Connection) -> None:
+    """Add return_7d_pct/return_90d_pct/return_180d_pct to live_metrics (needed alongside the
+    existing return_30d_pct/return_365d_pct -- see _refresh_live_metrics). No-ops once already
+    migrated."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(live_metrics)")}
+    if not cols:
+        return  # table doesn't exist yet (handled by the CREATE TABLE IF NOT EXISTS above)
+    for column in ["return_7d_pct", "return_90d_pct", "return_180d_pct"]:
+        if column not in cols:
+            conn.execute(f"ALTER TABLE live_metrics ADD COLUMN {column} REAL")
+    conn.commit()
+
+
 def _migrate_price_cache_meta_columns(conn: sqlite3.Connection) -> None:
     """Add earliest_date to price_cache_meta (needed to tell whether a configured
     PRICE_HISTORY_START_DATE has moved earlier than what's already cached) and backfill it
-    from price_history_cache for any pre-existing rows. No-ops once already migrated."""
+    from price_history_cache for any pre-existing rows. Also adds backfill_exhausted_start_date
+    (needed by fill_price_cache_for_universe to stop retrying a backward-fill that a complete
+    bhavcopy day-walk has already confirmed can't go back any further — see that function's
+    docstring). No-ops once already migrated."""
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(price_cache_meta)")}
     if not cols:
         return  # table doesn't exist yet (handled by the CREATE TABLE IF NOT EXISTS above)
     if "earliest_date" not in cols:
         conn.execute("ALTER TABLE price_cache_meta ADD COLUMN earliest_date TEXT")
+    if "backfill_exhausted_start_date" not in cols:
+        conn.execute("ALTER TABLE price_cache_meta ADD COLUMN backfill_exhausted_start_date TEXT")
     conn.execute(
         """
         UPDATE price_cache_meta
@@ -595,6 +739,133 @@ def _migrate_security_classification_split(conn: sqlite3.Connection) -> None:
     for column in classification_cols:
         if column in cols:
             conn.execute(f"ALTER TABLE instrument_master DROP COLUMN {column}")
+    conn.commit()
+
+
+IICS_CLASSIFICATION_SOURCE = "nse_bse_iics_screener"
+_IICS_SEED_CSV_PATH = PROJECT_ROOT / "data" / "iics_classification.csv"
+
+
+def _migrate_security_classification_iics_columns(conn: sqlite3.Connection) -> None:
+    """Add the Macro-Economic Sector level and every level's numeric IICS code to
+    security_classification -- the table previously only had 3 of the official 4 levels
+    (sector/industry/basic_industry names, no macro_sector, no codes at all). No-ops once
+    already migrated. The existing sector/industry/basic_industry name columns are reused as-is
+    for IICS's Sector/Industry/Basic-Industry names -- see build_iics_classification_mapping."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(security_classification)")}
+    if not cols:
+        return  # table doesn't exist yet (handled by the CREATE TABLE IF NOT EXISTS above)
+    for column in ["macro_sector_code", "macro_sector", "sector_code", "industry_code", "basic_industry_code"]:
+        if column not in cols:
+            conn.execute(f"ALTER TABLE security_classification ADD COLUMN {column} TEXT")
+    conn.commit()
+
+
+def store_security_classification(
+    ticker: str,
+    *,
+    macro_sector_code: str | None,
+    macro_sector: str | None,
+    sector_code: str | None,
+    sector: str | None,
+    industry_code: str | None,
+    industry: str | None,
+    basic_industry_code: str | None,
+    basic_industry: str | None,
+    source: str,
+) -> bool:
+    """Persist one ticker's full 4-level IICS classification into security_classification.
+    Used by both the one-time screener.in/BSE-PDF backfill (source=IICS_CLASSIFICATION_SOURCE)
+    and load_iics_classification_seed (replaying the committed data/iics_classification.csv into
+    a fresh DB). sync_instrument_master's routine CSV-sourced sync is guarded to never overwrite
+    a row this wrote -- see its classification upsert."""
+    ticker_key = _cache_ticker(ticker)
+    if not ticker_key:
+        return False
+    synced_at = _current_market_datetime().isoformat()
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        ticker_id = _ticker_id(conn, ticker_key, create=True)
+        conn.execute(
+            """
+            INSERT INTO security_classification
+            (ticker_id, macro_sector_code, macro_sector, sector_code, sector, industry_code, industry,
+             basic_industry_code, basic_industry, classification_source, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticker_id) DO UPDATE SET
+                macro_sector_code=excluded.macro_sector_code,
+                macro_sector=excluded.macro_sector,
+                sector_code=excluded.sector_code,
+                sector=excluded.sector,
+                industry_code=excluded.industry_code,
+                industry=excluded.industry,
+                basic_industry_code=excluded.basic_industry_code,
+                basic_industry=excluded.basic_industry,
+                classification_source=excluded.classification_source,
+                synced_at=excluded.synced_at
+            """,
+            (
+                ticker_id, macro_sector_code, macro_sector, sector_code, sector, industry_code, industry,
+                basic_industry_code, basic_industry, source, synced_at,
+            ),
+        )
+        conn.commit()
+    return True
+
+
+def _load_iics_classification_seed_if_needed(conn: sqlite3.Connection) -> None:
+    """Seed security_classification from the committed data/iics_classification.csv on a fresh
+    (or not-yet-seeded) database -- pure local file + DB write, no network. This is what makes a
+    fresh clone of the repo get this data without ever re-scraping screener.in: the scrape itself
+    only ever happens via the separate, manual scripts/build_iics_classification.py, which writes
+    that CSV; this function just replays it. Called from _ensure_price_cache_schema, which runs on
+    nearly every connection this app opens, so it must stay cheap once already seeded -- a single
+    EXISTS check, no file I/O, before touching the CSV at all."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(security_classification)")}
+    if "classification_source" not in cols:
+        return  # table/column doesn't exist yet
+    already_seeded = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM security_classification WHERE classification_source = ?)",
+        (IICS_CLASSIFICATION_SOURCE,),
+    ).fetchone()[0]
+    if already_seeded or not _IICS_SEED_CSV_PATH.exists():
+        return
+    with _IICS_SEED_CSV_PATH.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            ticker_key = _cache_ticker(row.get("ticker"))
+            if not ticker_key:
+                continue
+            ticker_id = _ticker_id(conn, ticker_key, create=True)
+            conn.execute(
+                """
+                INSERT INTO security_classification
+                (ticker_id, macro_sector_code, macro_sector, sector_code, sector, industry_code, industry,
+                 basic_industry_code, basic_industry, classification_source, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker_id) DO UPDATE SET
+                    macro_sector_code=excluded.macro_sector_code,
+                    macro_sector=excluded.macro_sector,
+                    sector_code=excluded.sector_code,
+                    sector=excluded.sector,
+                    industry_code=excluded.industry_code,
+                    industry=excluded.industry,
+                    basic_industry_code=excluded.basic_industry_code,
+                    basic_industry=excluded.basic_industry,
+                    classification_source=excluded.classification_source,
+                    synced_at=excluded.synced_at
+                WHERE security_classification.classification_source IS NOT ?
+                """,
+                (
+                    ticker_id,
+                    row.get("macro_sector_code"), row.get("macro_sector"),
+                    row.get("sector_code"), row.get("sector"),
+                    row.get("industry_code"), row.get("industry"),
+                    row.get("basic_industry_code"), row.get("basic_industry"),
+                    IICS_CLASSIFICATION_SOURCE, row.get("synced_at") or row.get("fetched_at") or _current_market_datetime().isoformat(),
+                    IICS_CLASSIFICATION_SOURCE,
+                ),
+            )
     conn.commit()
 
 
@@ -786,6 +1057,7 @@ def sync_instrument_master(universes: list[str] | None = None) -> dict[str, Any]
                 INSERT INTO security_classification (ticker_id, synced_at, {", ".join(_SECURITY_CLASSIFICATION_COLUMNS)})
                 VALUES (?, ?, {", ".join("?" for _ in _SECURITY_CLASSIFICATION_COLUMNS)})
                 ON CONFLICT(ticker_id) DO UPDATE SET {classification_update}
+                WHERE security_classification.classification_source IS NOT '{IICS_CLASSIFICATION_SOURCE}'
                 """,
                 classification_rows,
             )
@@ -825,9 +1097,16 @@ def sync_instrument_master(universes: list[str] | None = None) -> dict[str, Any]
     return {"synced_ticker_count": len(identity_rows), "universes": universes_used}
 
 
-def list_instrument_master_tickers(universe: str) -> list[str]:
+def list_instrument_master_tickers(universe: str, *, active_only: bool = True) -> list[str]:
     """Return tickers from instrument_master for an exchange-derivable universe ('full_nse',
-    'full_bse', 'all_india') or 'broad' (via the in_nifty_total_market flag)."""
+    'full_bse', 'all_india') or 'broad' (via the in_nifty_total_market flag).
+
+    active_only=True (default) excludes tickers confirmed dormant by
+    fill_price_cache_for_universe (zero trades found across a full bhavcopy day-walk) — the same
+    "NULL = active" convention as list_all_instrument_master_tickers. This is the universe source
+    for every sector/industry/breadth/RRG/crossover/top-gainers analytics function, so a dormant
+    ticker's last (stale, possibly months old) cached price no longer gets compared against
+    everything else as if it were current."""
     normalized = str(universe or "").strip().lower()
     if normalized in {"broad", "nse_total_market", "nifty_total_market", "total_market"}:
         where = "in_nifty_total_market = 1"
@@ -837,6 +1116,8 @@ def list_instrument_master_tickers(universe: str) -> list[str]:
         where = "market = 'IN' AND exchange IN ('BSE', 'NSE+BSE')"
     else:  # all_india and aliases
         where = "market = 'IN'"
+    if active_only:
+        where += " AND active IS NOT 0"
     with _price_cache_connection() as conn:
         _ensure_price_cache_schema(conn)
         rows = conn.execute(f"SELECT ticker FROM instrument_master WHERE {where}").fetchall()
@@ -887,59 +1168,373 @@ def lookup_instrument_identity(ticker: str) -> dict[str, Any] | None:
     }
 
 
-def backfill_market_cap_from_yfinance(tickers: list[str] | None = None, *, max_workers: int = 8) -> dict[str, Any]:
-    """Fetch yfinance marketCap for the given tickers (default: every instrument_master ticker)
-    and upsert into market_cap.market_cap. Real per-ticker network cost (one call per ticker) —
-    call explicitly; not part of any automatic sync."""
+def list_tickers_missing_shares_outstanding(
+    *, active_only: bool = True, include_screener_sourced: bool = False
+) -> list[str]:
+    """instrument_master tickers with no market_cap.shares_outstanding yet — the candidate set
+    for scripts/backfill_shares_outstanding.py. Shares outstanding barely changes (only on
+    buybacks/issuance/splits/bonus issues), so once set for a ticker it stays out of this list
+    until manually cleared, unlike price/market cap which need refreshing constantly.
+
+    include_screener_sourced=True also returns tickers whose current value came from the
+    lower-quality screener.in-derived fallback (source='screener_derived') -- upgrade candidates
+    for the NSE XBRL pass, which is more authoritative. Used only by that pass; the default keeps
+    this a pure "still has nothing" query."""
+    where_active = "im.active IS NOT 0" if active_only else "1=1"
+    missing_clause = "mc.shares_outstanding IS NULL"
+    if include_screener_sourced:
+        missing_clause = f"({missing_clause} OR mc.shares_outstanding_source = 'screener_derived')"
     with _price_cache_connection() as conn:
         _ensure_price_cache_schema(conn)
-        if tickers is None:
-            tickers = [row["ticker"] for row in conn.execute("SELECT ticker FROM instrument_master")]
-        ticker_id_map = _bulk_ticker_ids(conn, tickers)
-
-    if not ticker_id_map:
-        return {"requested_ticker_count": 0, "updated_ticker_count": 0, "missing_ticker_count": 0}
-
-    def _fetch_one(ticker: str) -> tuple[str, float | None]:
-        try:
-            info = yf.Ticker(ticker).info or {}
-        except Exception:  # noqa: BLE001
-            return ticker, None
-        value = info.get("marketCap")
-        return ticker, (float(value) if isinstance(value, (int, float)) else None)
-
-    results: dict[str, float | None] = {}
-    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(ticker_id_map)))) as executor:
-        futures = [executor.submit(_fetch_one, ticker) for ticker in ticker_id_map]
-        for future in as_completed(futures):
-            ticker, market_cap = future.result()
-            results[ticker] = market_cap
-
-    fetched_at = _current_market_datetime().isoformat()
-    rows_to_write = [
-        (ticker_id_map[ticker], market_cap, fetched_at, fetched_at)
-        for ticker, market_cap in results.items()
-        if market_cap is not None
-    ]
-    with _price_cache_connection() as conn:
-        conn.executemany(
+        rows = conn.execute(
+            f"""
+            SELECT im.ticker AS ticker
+            FROM instrument_master im
+            LEFT JOIN market_cap mc ON mc.ticker_id = im.ticker_id
+            WHERE {where_active} AND {missing_clause}
             """
-            INSERT INTO market_cap (ticker_id, market_cap, date, fetched_at)
+        ).fetchall()
+    return [row["ticker"] for row in rows]
+
+
+def store_shares_outstanding(ticker: str, shares_outstanding: float, *, source: str) -> bool:
+    """Persist a shares-outstanding figure for one ticker into market_cap. source is
+    "nse_xbrl" (scripts/backfill_shares_outstanding.py's primary, official pass) or
+    "screener_derived" (its opt-in fallback for BSE-only tickers NSE doesn't cover). Everywhere
+    else, market cap itself is derived cheaply and locally from this by
+    recompute_market_cap_from_shares_outstanding()."""
+    ticker_key = _cache_ticker(ticker)
+    if not ticker_key or not shares_outstanding or shares_outstanding <= 0:
+        return False
+    fetched_at = _current_market_datetime().isoformat()
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        ticker_id = _ticker_id(conn, ticker_key, create=True)
+        conn.execute(
+            """
+            INSERT INTO market_cap (ticker_id, shares_outstanding, shares_outstanding_source, shares_outstanding_fetched_at)
             VALUES (?, ?, ?, ?)
-            ON CONFLICT(ticker_id) DO UPDATE SET market_cap=excluded.market_cap, date=excluded.date, fetched_at=excluded.fetched_at
+            ON CONFLICT(ticker_id) DO UPDATE SET
+                shares_outstanding=excluded.shares_outstanding,
+                shares_outstanding_source=excluded.shares_outstanding_source,
+                shares_outstanding_fetched_at=excluded.shares_outstanding_fetched_at
             """,
-            rows_to_write,
+            (ticker_id, shares_outstanding, source, fetched_at),
         )
         conn.commit()
+    return True
+
+
+def recompute_market_cap_from_shares_outstanding() -> dict[str, Any]:
+    """Recompute market_cap.market_cap = shares_outstanding * latest close (price_data), for
+    every ticker that has a shares_outstanding on file. Pure local SQL, no network call — safe
+    to run on every price-cache refresh, since shares_outstanding itself is only ever updated by
+    the separate, occasional screener.in backfill script. This is what makes market cap "fresh
+    every day" without fetching it every day."""
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        fetched_at = _current_market_datetime().isoformat()
+        cursor = conn.execute(
+            """
+            UPDATE market_cap
+            SET market_cap = shares_outstanding * (
+                    SELECT pd.close FROM price_data pd WHERE pd.ticker_id = market_cap.ticker_id
+                ),
+                date = (
+                    SELECT pd.date FROM price_data pd WHERE pd.ticker_id = market_cap.ticker_id
+                ),
+                fetched_at = ?
+            WHERE shares_outstanding IS NOT NULL
+              AND EXISTS (SELECT 1 FROM price_data pd WHERE pd.ticker_id = market_cap.ticker_id AND pd.close IS NOT NULL)
+            """,
+            (fetched_at,),
+        )
+        conn.commit()
+        updated = cursor.rowcount if cursor.rowcount is not None else 0
+    return {"recomputed_ticker_count": max(0, updated)}
+
+
+def clean_zero_volume_yfinance_rows(*, dry_run: bool = True) -> dict[str, Any]:
+    """One-time cleanup for price_history_cache rows written before _store_price_history started
+    discarding Yahoo's zero-volume placeholder rows (see its docstring): yf.download regularly
+    carries a thinly-traded security's last known close forward as a synthetic zero-volume row for
+    days it didn't actually trade, and every one of those written before the fix is still sitting
+    in the cache today, corrupting latest_date/earliest_date and every return calculation that
+    reads price_history_cache.
+
+    Deletes every price_history_cache row with provider='yfinance_batch' and volume 0/NULL, then
+    for each affected ticker recomputes price_cache_meta (latest_date/earliest_date/row_count) and
+    live_metrics from whatever real rows remain -- so a ticker whose latest cached row was fake
+    correctly rolls back to its last genuine trade date, making it eligible for normal
+    re-classification (and eventually Phase C / dormancy confirmation) on the next refresh.
+
+    dry_run=True (default): reports what would change without deleting or updating anything.
+    Safe to re-run any number of times -- a no-op once the cache is clean.
+    """
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        fake_row_filter = "interval = '1d' AND provider = 'yfinance_batch' AND (volume = 0 OR volume IS NULL)"
+        affected_ids = [
+            row["ticker_id"]
+            for row in conn.execute(f"SELECT DISTINCT ticker_id FROM price_history_cache WHERE {fake_row_filter}").fetchall()
+        ]
+        rows_matched = int(
+            conn.execute(f"SELECT COUNT(*) AS cnt FROM price_history_cache WHERE {fake_row_filter}").fetchone()["cnt"] or 0
+        )
+
+        if dry_run or not affected_ids:
+            return {
+                "dry_run": dry_run,
+                "rows_deleted": 0,
+                "rows_matched": rows_matched,
+                "tickers_affected": len(affected_ids),
+                "tickers_latest_date_changed": 0,
+            }
+
+        conn.execute(f"DELETE FROM price_history_cache WHERE {fake_row_filter}")
+
+        today = _current_market_datetime().date()
+        latest_date_changed_count = 0
+        for ticker_id in affected_ids:
+            existing_meta = conn.execute(
+                "SELECT latest_date FROM price_cache_meta WHERE ticker_id = ? AND interval = '1d'", (ticker_id,)
+            ).fetchone()
+            old_latest = str(existing_meta["latest_date"]) if existing_meta and existing_meta["latest_date"] else None
+
+            remaining = conn.execute(
+                """
+                SELECT MIN(date) AS earliest_date, MAX(date) AS latest_date, COUNT(*) AS row_count
+                FROM price_history_cache WHERE ticker_id = ? AND interval = '1d'
+                """,
+                (ticker_id,),
+            ).fetchone()
+            new_latest = str(remaining["latest_date"]) if remaining and remaining["row_count"] else None
+
+            if new_latest:
+                new_earliest = str(remaining["earliest_date"])
+                max_period_days = max(1, (today - datetime.strptime(new_earliest, "%Y-%m-%d").date()).days)
+                conn.execute(
+                    """
+                    UPDATE price_cache_meta
+                    SET latest_date = ?, earliest_date = ?, row_count = ?, max_period_days = ?
+                    WHERE ticker_id = ? AND interval = '1d'
+                    """,
+                    (new_latest, new_earliest, int(remaining["row_count"]), max_period_days, ticker_id),
+                )
+                latest_row = conn.execute(
+                    "SELECT close FROM price_history_cache WHERE ticker_id = ? AND interval = '1d' AND date = ?",
+                    (ticker_id, new_latest),
+                ).fetchone()
+                if latest_row and latest_row["close"] is not None:
+                    _refresh_live_metrics(conn, ticker_id, "1d", new_latest, float(latest_row["close"]))
+            else:
+                # every cached row for this ticker was fake -- nothing real left at all.
+                conn.execute(
+                    "UPDATE price_cache_meta SET latest_date = NULL, earliest_date = NULL, row_count = 0 WHERE ticker_id = ? AND interval = '1d'",
+                    (ticker_id,),
+                )
+
+            # price_data holds a single "current" snapshot per ticker; if it was pointing at a
+            # date that just got deleted as fake, roll it back to the last real row (or leave it
+            # empty if nothing real remains) -- deliberately bypassing the normal
+            # WHERE excluded.date >= price_data.date guard, since this is a corrective rollback,
+            # not a routine fetch that should never regress.
+            price_data_row = conn.execute("SELECT date FROM price_data WHERE ticker_id = ?", (ticker_id,)).fetchone()
+            if price_data_row and price_data_row["date"] and str(price_data_row["date"]) != new_latest:
+                if new_latest:
+                    real_row = conn.execute(
+                        """
+                        SELECT date, open, high, low, close, volume FROM price_history_cache
+                        WHERE ticker_id = ? AND interval = '1d' AND date = ?
+                        """,
+                        (ticker_id, new_latest),
+                    ).fetchone()
+                    if real_row:
+                        conn.execute(
+                            """
+                            UPDATE price_data
+                            SET date = ?, open = ?, high = ?, low = ?, close = ?, volume = ?
+                            WHERE ticker_id = ?
+                            """,
+                            (
+                                real_row["date"], real_row["open"], real_row["high"], real_row["low"],
+                                real_row["close"], real_row["volume"], ticker_id,
+                            ),
+                        )
+                else:
+                    conn.execute("DELETE FROM price_data WHERE ticker_id = ?", (ticker_id,))
+
+            if new_latest != old_latest:
+                latest_date_changed_count += 1
+
+        conn.commit()
+
     return {
-        "requested_ticker_count": len(ticker_id_map),
-        "updated_ticker_count": len(rows_to_write),
-        "missing_ticker_count": len(ticker_id_map) - len(rows_to_write),
+        "dry_run": dry_run,
+        "rows_deleted": rows_matched,
+        "rows_matched": rows_matched,
+        "tickers_affected": len(affected_ids),
+        "tickers_latest_date_changed": latest_date_changed_count,
+    }
+
+
+def backfill_shares_outstanding(
+    tickers: list[str] | None = None,
+    *,
+    force_refresh_all: bool = False,
+    include_screener_fallback: bool = False,
+    delay_seconds: float = SCREENER_DEFAULT_REQUEST_DELAY_SECONDS,
+    limit: int | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Fill market_cap.shares_outstanding, NSE shareholding-pattern XBRL first (official, free,
+    bulk), screener.in as an opt-in fallback for tickers with no NSE listing at all (the BSE-only
+    tail). Shared by scripts/backfill_shares_outstanding.py (thin CLI wrapper) and the sidebar's
+    "Backfill shares outstanding" button — the one place this ever gets fetched from a provider,
+    same role fill_price_cache_for_universe plays for price history.
+
+    tickers=None (default): candidates are every active ticker missing a value, or still on the
+    lower-quality screener-derived source (upgrade candidates) — unless force_refresh_all=True, in
+    which case every active ticker is re-checked regardless of current value/source.
+    include_screener_fallback=False (default): tickers NSE can't resolve are just left missing —
+    screener.in's terms restrict bulk copying, so that path only runs when explicitly asked for.
+    limit: cap the candidate list after derivation — for quick manual test runs, not used by the
+    sidebar button.
+    """
+    if tickers is not None:
+        candidates = list(tickers)
+    elif force_refresh_all:
+        candidates = list_all_instrument_master_tickers(active_only=True)
+    else:
+        candidates = list_tickers_missing_shares_outstanding(include_screener_sourced=True)
+    if limit is not None:
+        candidates = candidates[: max(0, limit)]
+
+    def _report(phase: str, completed: int, total: int, **extra: Any) -> None:
+        if progress_callback:
+            progress_callback({"phase": phase, "completed": completed, "total": total, **extra})
+
+    nse_result = _backfill_shares_outstanding_via_nse(candidates, delay_seconds=delay_seconds, report=_report)
+    still_missing = nse_result.pop("still_missing")
+
+    screener_result: dict[str, Any] = {
+        "screener_candidate_count": 0,
+        "screener_updated_count": 0,
+        "screener_skipped_count": 0,
+    }
+    if still_missing and include_screener_fallback:
+        screener_result = _backfill_shares_outstanding_via_screener(
+            still_missing, delay_seconds=delay_seconds, report=_report
+        )
+        final_missing_count = screener_result["screener_skipped_count"]
+    else:
+        final_missing_count = len(still_missing)
+
+    return {**nse_result, **screener_result, "still_missing_count": final_missing_count}
+
+
+def _backfill_shares_outstanding_via_nse(
+    candidates: list[str],
+    *,
+    delay_seconds: float,
+    report: Callable[..., None],
+) -> dict[str, Any]:
+    """Phase A: resolve candidates from NSE's shareholding-pattern XBRL. .NS tickers match by
+    bare symbol; .BO tickers match by ISIN cross-reference (shareholding pattern is company-wide,
+    so an NSE filing correctly answers a BSE-format ticker's share count too, when the company is
+    also NSE-listed)."""
+    total = len(candidates)
+    if total == 0:
+        return {"nse_candidate_count": 0, "nse_resolved_count": 0, "nse_isin_cross_referenced_count": 0, "still_missing": []}
+
+    session = nse_session()
+    equities = fetch_shareholding_master(session, universe="equities")
+    sme = fetch_shareholding_master(
+        session,
+        universe="sme",
+        from_date=default_sme_lookback_from_date(),
+        to_date=_current_market_datetime().date().strftime("%d-%m-%Y"),
+    )
+    by_symbol, by_isin = build_shareholding_index(equities + sme)
+
+    resolved_via_symbol = 0
+    resolved_via_isin = 0
+    still_missing: list[str] = []
+
+    for index, ticker in enumerate(candidates, start=1):
+        record = None
+        via_isin = False
+        if ticker.endswith(".NS"):
+            record = by_symbol.get(ticker[: -len(".NS")])
+        elif ticker.endswith(".BO"):
+            identity = lookup_instrument_identity(ticker) or {}
+            isin = str(identity.get("isin") or "").strip().upper()
+            if isin:
+                record = by_isin.get(isin)
+                via_isin = record is not None
+
+        resolved = False
+        if record is not None:
+            xbrl_url = record.get("xbrl")
+            shares = None
+            if xbrl_url:
+                try:
+                    xr = requests.get(xbrl_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+                    if xr.status_code == 200:
+                        shares = extract_total_paid_up_shares(xr.text)
+                except requests.RequestException:
+                    shares = None
+                if index < total:
+                    time_module.sleep(delay_seconds)
+            if shares and store_shares_outstanding(ticker, shares, source="nse_xbrl"):
+                resolved = True
+                if via_isin:
+                    resolved_via_isin += 1
+                else:
+                    resolved_via_symbol += 1
+
+        if not resolved:
+            still_missing.append(ticker)
+        report("shares_outstanding_nse", index, total, source="nse_xbrl")
+
+    return {
+        "nse_candidate_count": total,
+        "nse_resolved_count": resolved_via_symbol + resolved_via_isin,
+        "nse_isin_cross_referenced_count": resolved_via_isin,
+        "still_missing": still_missing,
+    }
+
+
+def _backfill_shares_outstanding_via_screener(
+    candidates: list[str],
+    *,
+    delay_seconds: float,
+    report: Callable[..., None],
+) -> dict[str, Any]:
+    """Phase B (opt-in only): screener.in-derived fallback for tickers NSE can't resolve — in
+    practice, tickers with no NSE listing at all (the BSE-only tail)."""
+    total = len(candidates)
+    session = requests.Session()
+    updated = 0
+    skipped = 0
+    for index, ticker in enumerate(candidates, start=1):
+        shares = fetch_screener_shares_outstanding(ticker, session=session)
+        if shares and store_shares_outstanding(ticker, shares, source="screener_derived"):
+            updated += 1
+        else:
+            skipped += 1
+        report("shares_outstanding_screener", index, total, source="screener")
+        if index < total:
+            time_module.sleep(delay_seconds)
+    return {
+        "screener_candidate_count": total,
+        "screener_updated_count": updated,
+        "screener_skipped_count": skipped,
     }
 
 
 def load_stock_universe_from_db(
-    universe: str, *, refresh: bool = False, max_stocks: int | None = None
+    universe: str, *, refresh: bool = False, max_stocks: int | None = None, active_only: bool = True
 ) -> pd.DataFrame:
     """DB-backed replacement for load_stock_universe() — same UNIVERSE_COLUMNS-shaped output,
     sourced from instrument_master + security_classification + market_cap + live_metrics
@@ -951,6 +1546,13 @@ def load_stock_universe_from_db(
     refresh of the underlying universe CSV first (via the same universe.py refresh_* functions),
     which already self-syncs instrument_master/security_classification/market_cap afterward — so
     the DB read below reflects the fresh data.
+
+    active_only=True (default) excludes tickers confirmed dormant by
+    fill_price_cache_for_universe — this is the universe source for every sector/industry/
+    breadth/RRG/crossover/top-gainers analytics function, so a dormant ticker's last (stale,
+    possibly months old) cached price no longer gets compared against everything else as if it
+    were current. The `active` column is still selected either way, so a caller that explicitly
+    wants the full picture can pass active_only=False and filter the returned frame itself.
     """
     normalized = str(universe or "").strip().lower()
     if refresh:
@@ -975,6 +1577,8 @@ def load_stock_universe_from_db(
         where = "im.market = 'IN'"
     else:  # "local" or unrecognized — never CSV/DB-backed
         return pd.DataFrame(columns=UNIVERSE_COLUMNS)
+    if active_only:
+        where += " AND im.active IS NOT 0"
 
     query = f"""
         SELECT
@@ -982,7 +1586,8 @@ def load_stock_universe_from_db(
             sc.sector, sc.industry, sc.basic_industry, sc.index_name,
             im.source, im.active, im.series,
             mc.free_float_market_cap,
-            lm.last_price, lm.year_high, lm.year_low, lm.near_52w_high_pct, lm.return_30d_pct, lm.return_365d_pct,
+            lm.last_price, lm.year_high, lm.year_low, lm.near_52w_high_pct,
+            lm.return_7d_pct, lm.return_30d_pct, lm.return_90d_pct, lm.return_180d_pct, lm.return_365d_pct,
             COALESCE(mc.fetched_at, lm.computed_at, im.synced_at) AS refreshed_at,
             im.exchange, im.security_id, im.nse_ticker, im.bse_ticker, im.nse_security_id, im.bse_security_id,
             sc.data_quality, sc.classification_source
@@ -1236,14 +1841,24 @@ def backfill_bhavcopy_history(
             provider = str(frame.attrs.get("provider") or "exchange_eod")
             provider_counts[provider] = provider_counts.get(provider, 0) + 1
         if progress_callback:
-            progress_callback({"phase": "scanning_days", "source": "bhavcopy", "completed": index + 1, "total": len(trade_dates)})
+            progress_callback(
+                {
+                    "phase": "scanning_days",
+                    "source": "bhavcopy",
+                    "completed": index + 1,
+                    "total": len(trade_dates),
+                    "ticker_count": len(unique_tickers),
+                }
+            )
 
     stored_count = 0
+    live_metrics_refreshed_count = 0
     for ticker, day_frames in frames_by_ticker.items():
         if day_frames:
             combined = pd.concat(day_frames, ignore_index=True)
             combined.attrs["provider"] = str(day_frames[-1].attrs.get("provider") or "exchange_eod_bhavcopy")
-            _store_price_history(ticker, interval, combined)
+            if _store_price_history(ticker, interval, combined):
+                live_metrics_refreshed_count += 1
             stored_count += 1
 
     no_data_tickers = [ticker for ticker, day_frames in frames_by_ticker.items() if not day_frames]
@@ -1257,6 +1872,7 @@ def backfill_bhavcopy_history(
         "tickers_without_data_count": len(no_data_tickers),
         "no_data_tickers": no_data_tickers[:50],
         "providers": provider_counts,
+        "live_metrics_refreshed_count": live_metrics_refreshed_count,
         "cache_status": get_price_cache_status(unique_tickers, interval=interval),
     }
 
@@ -1297,6 +1913,105 @@ def _tickers_without_price_cache(
     return [row["ticker"] for row in rows]
 
 
+def _tickers_still_short_of_start_date(tickers: list[str], *, start_date: str, interval: str) -> list[str]:
+    """Which of these tickers still have earliest_date > start_date right now, and aren't
+    already exhausted for this exact start_date. Deliberately DB-truth-based rather than
+    tracking "did the Yahoo fetch report success or failure" -- a Yahoo attempt can "succeed"
+    while returning almost nothing (e.g. one stray trading day for an illiquid ticker), which
+    still leaves the ticker genuinely short. Relying on the fetch's own success/failure signal
+    was exactly the gap that let such tickers cycle through full_fetch forever, always
+    "succeeding" against a source that never has enough to satisfy them."""
+    unique = list(dict.fromkeys(_cache_ticker(t) for t in tickers if _cache_ticker(t)))
+    if not unique:
+        return []
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        placeholders = ",".join("?" for _ in unique)
+        rows = conn.execute(
+            f"""
+            SELECT im.ticker AS ticker
+            FROM instrument_master im JOIN price_cache_meta m ON m.ticker_id = im.ticker_id
+            WHERE m.interval = ? AND im.ticker IN ({placeholders})
+              AND m.earliest_date > ?
+              AND (m.backfill_exhausted_start_date IS NULL OR m.backfill_exhausted_start_date != ?)
+            """,
+            [interval, *unique, start_date, start_date],
+        ).fetchall()
+    return [row["ticker"] for row in rows]
+
+
+def _tickers_stale_beyond(tickers: list[str], *, cutoff_date: str, interval: str) -> list[str]:
+    """Which of these tickers have latest_date older than cutoff_date right now. Used to find
+    forward-fill tickers that are stuck, not just a day or two behind (see
+    settings.forward_fetch_stale_days) -- unlike the backward-fill exhausted-marker, there's no
+    permanent "confirmed" state here (a ticker could resume trading any day), so this is just a
+    plain DB-truth check, re-evaluated fresh each call rather than cached."""
+    unique = list(dict.fromkeys(_cache_ticker(t) for t in tickers if _cache_ticker(t)))
+    if not unique:
+        return []
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        placeholders = ",".join("?" for _ in unique)
+        rows = conn.execute(
+            f"""
+            SELECT im.ticker AS ticker
+            FROM instrument_master im JOIN price_cache_meta m ON m.ticker_id = im.ticker_id
+            WHERE m.interval = ? AND im.ticker IN ({placeholders}) AND m.latest_date < ?
+            """,
+            [interval, *unique, cutoff_date],
+        ).fetchall()
+    return [row["ticker"] for row in rows]
+
+
+def _min_latest_date(tickers: list[str], *, interval: str) -> str | None:
+    """The earliest price_cache_meta.latest_date among these tickers, or None if none have a
+    meta row. Used to narrow Phase C's bhavcopy day-walk range when every candidate this run is
+    forward-stale-origin -- each already has solid history up to its own latest_date, so only
+    latest_date onward is new ground; walking all the way back to effective_start_date for such a
+    batch would just re-confirm history that's already known good."""
+    unique = list(dict.fromkeys(_cache_ticker(t) for t in tickers if _cache_ticker(t)))
+    if not unique:
+        return None
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        placeholders = ",".join("?" for _ in unique)
+        row = conn.execute(
+            f"""
+            SELECT MIN(m.latest_date) AS min_latest_date
+            FROM instrument_master im JOIN price_cache_meta m ON m.ticker_id = im.ticker_id
+            WHERE m.interval = ? AND im.ticker IN ({placeholders}) AND m.latest_date IS NOT NULL
+            """,
+            [interval, *unique],
+        ).fetchone()
+    return str(row["min_latest_date"]) if row and row["min_latest_date"] else None
+
+
+def _count_tickers_pending_dormancy_check(
+    tickers: list[str], *, stale_cutoff_date: str, expected_trading_day: str, interval: str
+) -> int:
+    """How many of these tickers are currently behind the latest expected trading day but haven't
+    yet gone stale_cutoff_date days without a trade -- i.e. still within the normal "a few days
+    behind is fine for a thinly-traded stock" window, not yet eligible for the Phase C dormancy
+    check. Surfaced in the completion message so a recurring forward-fetch/failed count reads as
+    "known, converging population" rather than "stuck forever"."""
+    unique = list(dict.fromkeys(_cache_ticker(t) for t in tickers if _cache_ticker(t)))
+    if not unique:
+        return 0
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        placeholders = ",".join("?" for _ in unique)
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM instrument_master im JOIN price_cache_meta m ON m.ticker_id = im.ticker_id
+            WHERE m.interval = ? AND im.ticker IN ({placeholders})
+              AND m.latest_date < ? AND m.latest_date >= ?
+            """,
+            [interval, *unique, expected_trading_day, stale_cutoff_date],
+        ).fetchone()
+    return int(row["cnt"] or 0)
+
+
 def _mark_tickers_dormant(tickers: list[str]) -> int:
     """Set instrument_master.active = 0 for the given tickers. Used when neither Yahoo nor a
     full bhavcopy day-walk of the configured history window found a single trade for a ticker —
@@ -1312,6 +2027,36 @@ def _mark_tickers_dormant(tickers: list[str]) -> int:
     return len(unique)
 
 
+def _mark_backfill_exhausted(tickers: list[str], *, start_date: str, interval: str) -> int:
+    """Record that a complete bhavcopy day-walk for [start_date, today] already confirmed these
+    tickers have nothing earlier than their current earliest_date. fill_price_cache_for_universe
+    then stops re-attempting their backward-fill on future runs, for this exact start_date --
+    past history can't change, so retrying is pure waste. Only call this after a bhavcopy pass
+    whose day-coverage was actually trustworthy (see min_bhavcopy_coverage_pct); a scan that
+    might have missed real trading days due to an outage must never produce this marker.
+    Only affects rows still short of start_date -- a ticker that happened to get backfilled by
+    something else in the meantime is left alone."""
+    unique = list(dict.fromkeys(_cache_ticker(t) for t in tickers if _cache_ticker(t)))
+    if not unique:
+        return 0
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        placeholders = ",".join("?" for _ in unique)
+        cursor = conn.execute(
+            f"""
+            UPDATE price_cache_meta
+            SET backfill_exhausted_start_date = ?
+            WHERE interval = ?
+              AND earliest_date > ?
+              AND ticker_id IN (SELECT ticker_id FROM instrument_master WHERE ticker IN ({placeholders}))
+            """,
+            [start_date, interval, start_date, *unique],
+        )
+        conn.commit()
+        updated = cursor.rowcount if cursor.rowcount is not None else 0
+    return max(0, updated)
+
+
 def _most_recent_expected_trading_day() -> str:
     """The latest calendar date price_cache_meta.latest_date should have reached, ignoring
     market holidays (only weekends are excluded). Before the daily close buffer, "today" isn't
@@ -1325,10 +2070,14 @@ def _most_recent_expected_trading_day() -> str:
     return expected.isoformat()
 
 
-def _fetch_and_store_range(chunk: list[str], start: str, end: str, interval: str) -> dict[str, pd.DataFrame]:
+def _fetch_and_store_range(chunk: list[str], start: str, end: str, interval: str) -> tuple[dict[str, pd.DataFrame], int]:
     """Fetch OHLCV for a chunk of tickers over [start, end) from Yahoo, overlay the latest
     official NSE/BSE EOD row, and persist. Only called from fill_price_cache_for_universe —
-    the one place price history is ever fetched from a provider."""
+    the one place price history is ever fetched from a provider.
+
+    Returns (fetched, live_metrics_refreshed_count) -- the second element is how many of this
+    chunk's tickers had live_metrics recomputed (i.e. reached a new latest_date), surfaced up
+    through fill_price_cache_for_universe's progress_callback for sidebar visibility."""
     try:
         raw = yf.download(
             tickers=chunk,
@@ -1343,12 +2092,14 @@ def _fetch_and_store_range(chunk: list[str], start: str, end: str, interval: str
         )
     except Exception as exc:
         logger.warning("Batch price history fetch failed for %s tickers (%s to %s): %s", len(chunk), start, end, exc)
-        return {}
+        return {}, 0
     fetched = _split_yahoo_batch_history(raw, chunk, interval=interval)
     fetched = _overlay_exchange_latest_rows(fetched, interval=interval)
+    live_metrics_refreshed_count = 0
     for ticker, frame in fetched.items():
-        _store_price_history(ticker, interval, frame)
-    return fetched
+        if _store_price_history(ticker, interval, frame):
+            live_metrics_refreshed_count += 1
+    return fetched, live_metrics_refreshed_count
 
 
 def fill_price_cache_for_universe(
@@ -1382,7 +2133,12 @@ def fill_price_cache_for_universe(
     Per ticker, classified against price_cache_meta as it stands *after* the priority pass:
       - no price_cache_meta row at all -> full-range Yahoo fetch from start_date to today.
       - cached earliest_date is after start_date (the configured floor moved earlier than
-        what's cached) -> backward-fill Yahoo fetch from start_date to the existing earliest_date.
+        what's cached) -> backward-fill Yahoo fetch from start_date to the existing earliest_date
+        -- UNLESS a complete bhavcopy day-walk already confirmed, for this exact start_date, that
+        nothing exists before earliest_date (backfill_exhausted_start_date matches), in which
+        case backward-fill is skipped entirely: past history can't change, so re-attempting a
+        confirmed-empty range is pure waste. Automatically re-eligible if start_date ever moves
+        earlier than what was checked.
       - cached latest_date is behind the most recent expected trading day -> forward Yahoo fetch
         from latest_date (inclusive, to safely re-cover a possibly-incomplete last row) to today.
       - needs both backward and forward -> treated as a full-range fetch (start_date to today);
@@ -1391,12 +2147,35 @@ def fill_price_cache_for_universe(
         the latest day).
       - neither -> skipped, zero network calls.
 
-      Fallback pass: any full_fetch/backward_fetch ticker Yahoo still failed on (forward_fetch
-      failures are skipped here -- the priority pass just tried the same recent window moments
-      earlier) gets a full bhavcopy day-walk over [start_date, today]. A ticker with zero trades
-      on either exchange across that entire range is marked instrument_master.active=0 (dormant)
-      so future refreshes stop retrying it -- guarded by a bhavcopy day-coverage check so a
-      transient NSE/BSE outage during the walk can't be misread as mass delisting.
+      Fallback pass: two INDEPENDENT bhavcopy confirmation walks, each with its own day-coverage
+      guard -- deliberately not one combined walk, since min_bhavcopy_coverage_pct is a per-walk
+      connectivity signal, and bundling both groups together would let one group's noisy walk
+      block the other's otherwise-clean confirmation (confirmed live: a batch of forward-stale
+      tickers stuck behind a bundled run's coverage dip came back clean and were marked
+      immediately once walked in isolation).
+        (a) backward-origin: any full_fetch/backward_fetch ticker Yahoo still failed on, plus any
+            that "succeeded" but is still short of start_date (a Yahoo attempt can succeed while
+            returning almost nothing) -- walked over the full [start_date, today], since these
+            genuinely need that whole range checked. A ticker with zero trades anywhere in it is
+            marked instrument_master.active=0 (dormant); one that still falls short of start_date
+            gets backfill_exhausted_start_date recorded (see above).
+        (b) forward-stale: any forward_fetch ticker still more than forward_fetch_stale_days
+            behind after its attempt (a ticker merely a day or two behind is skipped here -- the
+            priority pass just tried the same recent window moments earlier, and that's what
+            forward_fetch is normally for) -- always walked from the earliest of these candidates'
+            own latest_date onward, never the full start_date range, since each already has solid
+            history up to that point. A candidate with nothing newer than its already-cached
+            latest_date is marked dormant.
+      Each pass is independently guarded by its own bhavcopy day-coverage check, so a transient
+      NSE/BSE outage during either walk can't be misread as mass delisting or a confirmed
+      historical floor for that pass -- without holding the other pass hostage to it.
+
+      Note: a Yahoo "success" is only trusted when the returned row has real volume -- Yahoo
+      regularly carries a thinly-traded security's last known close forward as a synthetic
+      zero-volume row for days it didn't actually trade, instead of returning nothing, and
+      _store_price_history discards those before they can masquerade as fresh data (verified
+      against bhavcopy: e.g. a real trade with volume on one day, flanked by identical
+      zero-volume Yahoo "closes" on the surrounding days).
     """
     effective_start_date = str(start_date or settings.price_history_start_date).strip()
     unique_tickers = list(dict.fromkeys(_cache_ticker(ticker) for ticker in tickers if _cache_ticker(ticker)))
@@ -1411,6 +2190,12 @@ def fill_price_cache_for_universe(
             "bhavcopy_fallback_recovered_count": 0,
             "dormant_marked_count": 0,
             "dormant_tickers": [],
+            "backfill_exhausted_marked_count": 0,
+            "backfill_exhausted_skipped_count": 0,
+            "forward_fetch_pending_dormancy_check_count": 0,
+            "forward_fetch_stale_days": int(settings.forward_fetch_stale_days),
+            "market_cap_recomputed_count": 0,
+            "live_metrics_updated_count": 0,
             "failed_count": 0,
             "failed_tickers": [],
             "start_date": effective_start_date,
@@ -1431,23 +2216,30 @@ def fill_price_cache_for_universe(
     expected_trading_day = _most_recent_expected_trading_day()
     end_exclusive = (today_date + timedelta(days=1)).isoformat()
 
+    # Running total of tickers whose live_metrics got recomputed this run, across every phase
+    # (this priority pass, the Yahoo phases below, and Phase A/Phase B bhavcopy walks) -- surfaced
+    # live via progress_callback for sidebar visibility, and returned as live_metrics_updated_count.
+    live_metrics_updated_total = 0
+
     priority_window_days = max(0, int(settings.bhavcopy_priority_window_days))
     if priority_window_days > 0 and interval == "1d":
         priority_start = (today_date - timedelta(days=priority_window_days)).isoformat()
-        backfill_bhavcopy_history(
+        priority_result = backfill_bhavcopy_history(
             unique_tickers,
             start_date=priority_start,
             end_date=today_date.isoformat(),
             interval=interval,
             progress_callback=_wrapped_progress("bhavcopy_priority"),
         )
+        live_metrics_updated_total += int(priority_result.get("live_metrics_refreshed_count") or 0)
 
     with _price_cache_connection() as conn:
         _ensure_price_cache_schema(conn)
         placeholders = ",".join("?" for _ in unique_tickers)
         meta_rows = conn.execute(
             f"""
-            SELECT im.ticker AS ticker, m.latest_date AS latest_date, m.earliest_date AS earliest_date
+            SELECT im.ticker AS ticker, m.latest_date AS latest_date, m.earliest_date AS earliest_date,
+                   m.backfill_exhausted_start_date AS backfill_exhausted_start_date
             FROM instrument_master im
             LEFT JOIN price_cache_meta m ON m.ticker_id = im.ticker_id AND m.interval = ?
             WHERE im.ticker IN ({placeholders})
@@ -1460,6 +2252,7 @@ def fill_price_cache_for_universe(
     backward_by_date: dict[str, list[str]] = {}
     forward_by_date: dict[str, list[str]] = {}
     skipped_count = 0
+    backfill_exhausted_skipped_count = 0
     for ticker in unique_tickers:
         meta = meta_by_ticker.get(ticker)
         latest_date = str(meta["latest_date"]) if meta and meta["latest_date"] else None
@@ -1468,7 +2261,17 @@ def fill_price_cache_for_universe(
             continue
         earliest_date = str(meta["earliest_date"]) if meta["earliest_date"] else latest_date
         needs_forward = latest_date < expected_trading_day
-        needs_backward = earliest_date > effective_start_date
+        # A complete bhavcopy day-walk already confirmed, for this exact start date, that nothing
+        # exists before earliest_date -- past history doesn't change, so don't keep re-attempting
+        # a backward-fill that can only ever fail again. Re-eligible automatically if
+        # effective_start_date ever moves earlier than what was checked (the marker just won't
+        # match any more).
+        exhausted_for_current_start = (
+            meta["backfill_exhausted_start_date"] == effective_start_date if meta else False
+        )
+        needs_backward = earliest_date > effective_start_date and not exhausted_for_current_start
+        if needs_backward is False and earliest_date > effective_start_date:
+            backfill_exhausted_skipped_count += 1
         if needs_forward and needs_backward:
             full_fetch.append(ticker)
         elif needs_backward:
@@ -1484,29 +2287,50 @@ def fill_price_cache_for_universe(
     fetched_counts = {"full_fetch": 0, "backward_fetch": 0, "forward_fetch": 0}
     failed: list[str] = []
 
-    def _report(phase: str) -> None:
+    def _report(phase: str, **extra: Any) -> None:
         if progress_callback:
-            progress_callback({"phase": phase, "source": "yfinance", "completed": completed, "total": total})
+            progress_callback(
+                {
+                    "phase": phase,
+                    "source": "yfinance",
+                    "completed": completed,
+                    "total": total,
+                    "live_metrics_updated_total": live_metrics_updated_total,
+                    **extra,
+                }
+            )
 
     _report("classifying")
 
     def _fetch_group(phase: str, group_tickers: list[str], start: str, end: str) -> None:
-        nonlocal completed
+        # completed/total (above) only move when a ticker actually succeeds -- a chunk that
+        # fails outright burns a whole retry cycle (real network time) with zero visible change,
+        # which reads as "stuck" from the UI. attempt/chunk below move on every single network
+        # call regardless of outcome, so progress stays visibly alive through a bad stretch.
+        nonlocal completed, live_metrics_updated_total
         remaining = list(group_tickers)
-        for _attempt in range(attempts):
+        for attempt_index in range(attempts):
             if not remaining:
                 break
+            chunks_this_attempt = max(1, (len(remaining) + chunk_size - 1) // chunk_size)
             still_remaining: list[str] = []
-            for chunk_start in range(0, len(remaining), chunk_size):
+            for chunk_index, chunk_start in enumerate(range(0, len(remaining), chunk_size), start=1):
                 chunk = remaining[chunk_start : chunk_start + chunk_size]
-                fetched = _fetch_and_store_range(chunk, start, end, interval)
+                fetched, live_metrics_count = _fetch_and_store_range(chunk, start, end, interval)
+                live_metrics_updated_total += live_metrics_count
                 for ticker in chunk:
                     if ticker in fetched:
                         fetched_counts[phase] += 1
                         completed += 1
                     else:
                         still_remaining.append(ticker)
-                _report(phase)
+                _report(
+                    phase,
+                    attempt=attempt_index + 1,
+                    attempts_total=attempts,
+                    chunk=chunk_index,
+                    chunks_total=chunks_this_attempt,
+                )
             remaining = still_remaining
         failed.extend(remaining)
 
@@ -1519,34 +2343,130 @@ def fill_price_cache_for_universe(
     for latest_date, group_tickers in forward_by_date.items():
         _fetch_group("forward_fetch", group_tickers, latest_date, end_exclusive)
 
-    # Fallback pass: only full_fetch/backward_fetch failures need this -- the priority pass
-    # already just tried the recent window for every ticker (including forward_fetch failures)
-    # moments ago, so retrying those via bhavcopy again wouldn't find anything new.
+    # Fallback pass: full_fetch/backward_fetch failures need this -- the priority pass already
+    # just tried the recent window for every ticker (including forward_fetch failures) moments
+    # ago, so retrying those via bhavcopy again wouldn't find anything new *this run*. Also
+    # includes:
+    #   - any full_fetch/backward_fetch-origin ticker that "succeeded" against Yahoo but whose
+    #     earliest date still doesn't reach effective_start_date (see
+    #     _tickers_still_short_of_start_date) -- otherwise a ticker Yahoo only ever returns one
+    #     stray trading day for "succeeds" forever and never gets confirmed exhausted.
+    #   - any forward_fetch-origin ticker still more than forward_fetch_stale_days behind after
+    #     its attempt (see _tickers_stale_beyond) -- a ticker that's merely a day or two behind
+    #     is normal (that's what forward_fetch is *for*), but one stuck for weeks despite every
+    #     priority pass and forward_fetch attempt in between is worth a real confirmation: if a
+    #     full day-walk finds nothing newer either, it's marked dormant instead of retried
+    #     forever. Unlike the backward-fill exhausted-marker, there's no permanent "confirmed"
+    #     state for this -- a still-active ticker that just hasn't traded recently stays a
+    #     candidate every run until it either gets fresh data or is confirmed dormant.
     bhavcopy_fallback_recovered_count = 0
     dormant_marked_count = 0
     dormant_tickers: list[str] = []
-    phase_c_candidates = [ticker for ticker in failed if ticker not in forward_fetch_tickers]
-    if phase_c_candidates and interval == "1d":
-        fallback_result = backfill_bhavcopy_history(
-            phase_c_candidates,
+    backfill_exhausted_marked_count = 0
+    backward_origin_tickers = full_fetch + [ticker for group in backward_by_date.values() for ticker in group]
+    still_short_after_yahoo = _tickers_still_short_of_start_date(
+        backward_origin_tickers, start_date=effective_start_date, interval=interval
+    )
+    forward_stale_cutoff = (today_date - timedelta(days=max(1, int(settings.forward_fetch_stale_days)))).isoformat()
+    forward_stale_candidates = _tickers_stale_beyond(
+        list(forward_fetch_tickers), cutoff_date=forward_stale_cutoff, interval=interval
+    )
+    backward_origin_candidates = [ticker for ticker in failed if ticker not in forward_fetch_tickers] + still_short_after_yahoo
+
+    newly_dormant: set[str] = set()
+    newly_recovered: set[str] = set()
+
+    # Two independent confirmation passes, deliberately not one combined walk+coverage-check --
+    # min_bhavcopy_coverage_pct is a per-walk signal (was the exchange reachable for most of the
+    # days THIS walk scanned), so bundling both candidate groups into one call means one group's
+    # connectivity noise decides both groups' fate. A backward-origin candidate forces the walk
+    # back to the full effective_start_date range; if even a handful of those ~700 scanned days
+    # have a hiccup, the shared percentage can dip below threshold and silently skip marking for
+    # an otherwise-clean forward-stale batch too (confirmed live: 55 forward-stale tickers stuck
+    # in a bundled run came back 94-100% coverage and marked dormant immediately once re-checked
+    # in isolation). Splitting them means each group's confirmation only depends on its own walk.
+    if backward_origin_candidates and interval == "1d":
+        fallback_result_a = backfill_bhavcopy_history(
+            backward_origin_candidates,
             start_date=effective_start_date,
             end_date=today_date.isoformat(),
             interval=interval,
             progress_callback=_wrapped_progress("bhavcopy_fallback"),
         )
-        scanned = int(fallback_result.get("trading_days_scanned") or 0)
-        covered = int(fallback_result.get("trading_days_with_bhavcopy_data") or 0)
-        coverage_pct = round(100 * covered / scanned, 2) if scanned else 0.0
+        scanned_a = int(fallback_result_a.get("trading_days_scanned") or 0)
+        covered_a = int(fallback_result_a.get("trading_days_with_bhavcopy_data") or 0)
+        coverage_pct_a = round(100 * covered_a / scanned_a, 2) if scanned_a else 0.0
+        live_metrics_updated_total += int(fallback_result_a.get("live_metrics_refreshed_count") or 0)
 
-        still_missing = set(_tickers_without_price_cache(interval=interval, active_only=True, tickers=phase_c_candidates))
-        recovered = [ticker for ticker in phase_c_candidates if ticker not in still_missing]
-        bhavcopy_fallback_recovered_count = len(recovered)
-        failed = [ticker for ticker in failed if ticker not in recovered]
+        still_missing_a = set(
+            _tickers_without_price_cache(interval=interval, active_only=True, tickers=backward_origin_candidates)
+        )
+        newly_recovered |= {ticker for ticker in backward_origin_candidates if ticker not in still_missing_a}
 
-        if still_missing and coverage_pct >= settings.min_bhavcopy_coverage_pct:
-            dormant_marked_count = _mark_tickers_dormant(list(still_missing))
-            dormant_tickers = sorted(still_missing)[:50]
-            failed = [ticker for ticker in failed if ticker not in still_missing]
+        if coverage_pct_a >= settings.min_bhavcopy_coverage_pct:
+            if still_missing_a:
+                dormant_marked_count += _mark_tickers_dormant(list(still_missing_a))
+                newly_dormant |= still_missing_a
+            # A trustworthy, complete day-walk just ran for every backward-origin candidate here --
+            # whichever still have a meta row (i.e. weren't just marked dormant above) but still
+            # fall short of effective_start_date are now confirmed, not just "not done yet". The
+            # UPDATE inside only touches rows that both exist and still fall short, so passing the
+            # full candidate list (including any just-dormant-marked ones, which have no meta row
+            # to match) is safe.
+            backfill_exhausted_marked_count = _mark_backfill_exhausted(
+                backward_origin_candidates, start_date=effective_start_date, interval=interval
+            )
+
+    if forward_stale_candidates and interval == "1d":
+        # Each forward-stale candidate already has solid history up to its own latest_date --
+        # only latest_date onward is new ground, so this walk is always narrowed to the earliest
+        # of those, independent of whatever range Pass A needed this run.
+        narrowed_start = _min_latest_date(forward_stale_candidates, interval=interval) or effective_start_date
+        fallback_result_b = backfill_bhavcopy_history(
+            forward_stale_candidates,
+            start_date=narrowed_start,
+            end_date=today_date.isoformat(),
+            interval=interval,
+            progress_callback=_wrapped_progress("bhavcopy_fallback"),
+        )
+        scanned_b = int(fallback_result_b.get("trading_days_scanned") or 0)
+        covered_b = int(fallback_result_b.get("trading_days_with_bhavcopy_data") or 0)
+        coverage_pct_b = round(100 * covered_b / scanned_b, 2) if scanned_b else 0.0
+        live_metrics_updated_total += int(fallback_result_b.get("live_metrics_refreshed_count") or 0)
+
+        still_missing_b = set(
+            _tickers_without_price_cache(interval=interval, active_only=True, tickers=forward_stale_candidates)
+        )
+        newly_recovered |= {ticker for ticker in forward_stale_candidates if ticker not in still_missing_b}
+
+        if coverage_pct_b >= settings.min_bhavcopy_coverage_pct:
+            # The walk above already covered every forward-stale candidate's own latest_date
+            # onward -- if it found nothing newer than what was already cached, that's
+            # authoritative: no trades since latest_date. Confirmed dormant, not just "still behind".
+            still_forward_stale = _tickers_stale_beyond(
+                forward_stale_candidates, cutoff_date=forward_stale_cutoff, interval=interval
+            )
+            if still_forward_stale:
+                dormant_marked_count += _mark_tickers_dormant(still_forward_stale)
+                newly_dormant |= set(still_forward_stale)
+
+    if newly_recovered:
+        bhavcopy_fallback_recovered_count = len(newly_recovered)
+        failed = [ticker for ticker in failed if ticker not in newly_recovered]
+    if newly_dormant:
+        dormant_tickers = sorted(newly_dormant)[:50]
+        failed = [ticker for ticker in failed if ticker not in newly_dormant]
+
+    # Free, local, no network: any ticker with a shares_outstanding on file (from the separate,
+    # occasional screener.in backfill script) gets its market_cap refreshed from today's close.
+    market_cap_recompute = recompute_market_cap_from_shares_outstanding()
+
+    forward_fetch_pending_dormancy_check_count = _count_tickers_pending_dormancy_check(
+        unique_tickers,
+        stale_cutoff_date=forward_stale_cutoff,
+        expected_trading_day=expected_trading_day,
+        interval=interval,
+    )
 
     return {
         "requested_ticker_count": total,
@@ -1557,6 +2477,12 @@ def fill_price_cache_for_universe(
         "bhavcopy_fallback_recovered_count": bhavcopy_fallback_recovered_count,
         "dormant_marked_count": dormant_marked_count,
         "dormant_tickers": dormant_tickers,
+        "backfill_exhausted_marked_count": backfill_exhausted_marked_count,
+        "backfill_exhausted_skipped_count": backfill_exhausted_skipped_count,
+        "forward_fetch_pending_dormancy_check_count": forward_fetch_pending_dormancy_check_count,
+        "forward_fetch_stale_days": int(settings.forward_fetch_stale_days),
+        "market_cap_recomputed_count": market_cap_recompute.get("recomputed_ticker_count", 0),
+        "live_metrics_updated_count": live_metrics_updated_total,
         "failed_count": len(failed),
         "failed_tickers": failed[:50],
         "start_date": effective_start_date,

@@ -33,6 +33,14 @@ class Settings(BaseModel):
     # ~90-95% floor a healthy run settles at (real market holidays look identical to a fetch
     # failure and always show up as "no data").
     min_bhavcopy_coverage_pct: float = float(os.getenv("MIN_BHAVCOPY_COVERAGE_PCT", "80.0"))
+    # A ticker whose latest_date is still this many days behind the expected trading day *after*
+    # a forward-fill attempt gets routed through the same full bhavcopy day-walk confirmation
+    # backward-fill uses -- if that authoritative scan finds nothing newer either, the ticker is
+    # marked dormant. Without this, a ticker that had a healthy cache and then genuinely stopped
+    # trading (suspended, delisted, merged) retries forever: forward_fetch failures are excluded
+    # from the confirmation pass by default (see fill_price_cache_for_universe), since a ticker
+    # that's merely a day or two behind is normal and shouldn't trigger a full day-walk.
+    forward_fetch_stale_days: int = int(os.getenv("FORWARD_FETCH_STALE_DAYS", "30"))
 
 settings = Settings()
 

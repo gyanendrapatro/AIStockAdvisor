@@ -36,11 +36,12 @@ from stock_advisor.config.settings import load_watchlists
 from stock_advisor.data.daily_refresh import load_daily_refresh_report, run_daily_market_data_refresh
 from stock_advisor.data.market_data import (
     CACHE_REFRESH_HINT,
-    backfill_market_cap_from_yfinance,
+    backfill_shares_outstanding,
     fill_price_cache_for_universe,
     get_price_cache_status,
     get_price_history,
     list_all_instrument_master_tickers,
+    recompute_market_cap_from_shares_outstanding,
     sync_instrument_master,
 )
 from stock_advisor.data.universe import list_sector_constituents, list_stock_universe
@@ -61,35 +62,48 @@ st.caption("Market, sector, and industry data uses official NSE/BSE EOD rows for
 
 
 @st.cache_resource
-def _market_cap_backfill_jobs() -> dict[str, dict[str, object]]:
+def _shares_outstanding_backfill_jobs() -> dict[str, dict[str, object]]:
     return {}
 
 
-def _latest_market_cap_backfill_job() -> dict[str, object] | None:
-    jobs = [job for job in _market_cap_backfill_jobs().values() if job.get("scope") == "market_cap_backfill"]
+def _latest_shares_outstanding_backfill_job() -> dict[str, object] | None:
+    jobs = [job for job in _shares_outstanding_backfill_jobs().values() if job.get("scope") == "shares_outstanding_backfill"]
     if not jobs:
         return None
     return sorted(jobs, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
 
 
-def _start_market_cap_backfill_job() -> dict[str, object]:
-    jobs = _market_cap_backfill_jobs()
+def _start_shares_outstanding_backfill_job(*, force_refresh_all: bool, include_screener_fallback: bool) -> dict[str, object]:
+    jobs = _shares_outstanding_backfill_jobs()
     for job in jobs.values():
-        if job.get("scope") == "market_cap_backfill" and job.get("status") == "running":
+        if job.get("scope") == "shares_outstanding_backfill" and job.get("status") == "running":
             return job
 
     job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
     job: dict[str, object] = {
         "id": job_id,
-        "scope": "market_cap_backfill",
+        "scope": "shares_outstanding_backfill",
         "status": "running",
         "started_at": datetime.now(timezone.utc).isoformat(),
+        "progress": {"phase": "starting", "completed": 0, "total": 0},
     }
     jobs[job_id] = job
 
+    def _on_progress(update: dict[str, object]) -> None:
+        job["progress"] = update
+
     def _runner() -> None:
         try:
-            result = backfill_market_cap_from_yfinance()
+            result = backfill_shares_outstanding(
+                force_refresh_all=force_refresh_all,
+                include_screener_fallback=include_screener_fallback,
+                progress_callback=_on_progress,
+            )
+            # Free, local, no network: reflect the freshly updated share counts in market_cap
+            # immediately, rather than waiting for the next price-cache refresh.
+            result["market_cap_recomputed_count"] = recompute_market_cap_from_shares_outstanding().get(
+                "recomputed_ticker_count", 0
+            )
             job["status"] = "completed"
             job["completed_at"] = datetime.now(timezone.utc).isoformat()
             job["result"] = result
@@ -98,7 +112,7 @@ def _start_market_cap_backfill_job() -> dict[str, object]:
             job["completed_at"] = datetime.now(timezone.utc).isoformat()
             job["error"] = str(exc)
 
-    threading.Thread(target=_runner, name=f"market-cap-backfill-{job_id}", daemon=True).start()
+    threading.Thread(target=_runner, name=f"shares-outstanding-backfill-{job_id}", daemon=True).start()
     return job
 
 
@@ -149,34 +163,102 @@ def _start_price_cache_fill_job() -> dict[str, object]:
     return job
 
 
+# Internal phase tokens (from fill_price_cache_for_universe / backfill_shares_outstanding's
+# progress_callback) mapped to plain-language status text. Numbers after each phase are a
+# progress count, not always a ticker count — bhavcopy phases count trading days scanned (one
+# exchange-wide file per day), not tickers, since bhavcopy cost scales with days, not tickers.
+_PHASE_LABELS = {
+    "bhavcopy_priority_scanning_days": "Checking today's official exchange data",
+    "classifying": "Checking what's already up to date",
+    "full_fetch": "Downloading full history for new tickers (Yahoo)",
+    "backward_fetch": "Filling in older history to reach the configured start date (Yahoo)",
+    "forward_fetch": "Catching up on the latest days (Yahoo)",
+    "bhavcopy_fallback_scanning_days": "Double-checking exchange archives for tickers Yahoo couldn't fetch",
+    "shares_outstanding_nse": "Checking NSE shareholding filings",
+    "shares_outstanding_screener": "Checking screener.in (fallback)",
+}
+
+
+def _humanize_phase(phase: str) -> str:
+    return _PHASE_LABELS.get(phase, phase.replace("_", " ").capitalize())
+
+
+def _batch_progress_suffix(progress: dict) -> str:
+    """Extra detail appended after the base "completed/total" progress number:
+    - fill_price_cache_for_universe's Yahoo phases: which batch/attempt is in flight. That moves
+      on every network call, even failing ones -- unlike completed/total, which only moves on a
+      success, so a stretch of failing retries would otherwise leave the number frozen for a
+      real stretch of time and read as stuck.
+    - bhavcopy day-walk phases (priority pass / the Yahoo-couldn't-fetch confirmation pass):
+      completed/total there counts trading days scanned, not tickers -- easy to misread as
+      "N of M tickers" otherwise -- so the actual ticker count being checked is spelled out.
+    """
+    chunk = progress.get("chunk")
+    if chunk:
+        chunks_total = progress.get("chunks_total")
+        attempt = progress.get("attempt")
+        attempts_total = progress.get("attempts_total")
+        bits = [f"batch {chunk}/{chunks_total}"]
+        if attempts_total and attempts_total > 1:
+            bits.append(f"attempt {attempt}/{attempts_total}")
+        return f" ({', '.join(bits)})"
+    ticker_count = progress.get("ticker_count")
+    if ticker_count:
+        return f" days ({ticker_count} tickers)"
+    return ""
+
+
 @st.fragment
-def _render_market_cap_backfill_status() -> None:
+def _render_shares_outstanding_backfill_status() -> None:
     # Fragment-scoped so its autorefresh only reruns this block, not the whole sidebar/page —
     # otherwise every 2.5s tick would reset the sidebar's scroll position for anyone scrolled
     # further down while a backfill is running.
-    market_cap_job = _latest_market_cap_backfill_job()
-    market_cap_running = bool(market_cap_job and market_cap_job.get("status") == "running")
-    if st.button("Backfill market cap (yfinance)", key="market_cap_backfill_button", disabled=market_cap_running):
-        _start_market_cap_backfill_job()
-        market_cap_job = _latest_market_cap_backfill_job()
-        market_cap_running = True
-    if market_cap_job:
-        mc_status = str(market_cap_job.get("status"))
-        if mc_status == "running":
-            st.info("Backfilling market cap...")
-            st_autorefresh(interval=2500, limit=None, key="market_cap_backfill_autorefresh")
-        elif mc_status == "completed":
-            mc_result = market_cap_job.get("result") or {}
-            st.success(
-                f"Updated {mc_result.get('updated_ticker_count', 0)}/{mc_result.get('requested_ticker_count', 0)} tickers."
+    force_refresh_all = st.checkbox(
+        "Force refresh all tickers",
+        key="shares_outstanding_force_refresh",
+        help="Off: only fill tickers missing a value, or upgrade ones still on the screener.in fallback. "
+        "On: re-check every active ticker regardless of current value/source.",
+    )
+    include_screener_fallback = st.checkbox(
+        "Also fetch BSE-only tickers via screener.in",
+        key="shares_outstanding_include_screener",
+        help="NSE has no listing at all for these, so this falls back to a screener.in-derived estimate. "
+        "screener.in's terms restrict bulk copying to personal, non-commercial use — off by default, "
+        "opt in each run.",
+    )
+    so_job = _latest_shares_outstanding_backfill_job()
+    so_running = bool(so_job and so_job.get("status") == "running")
+    if st.button("Backfill shares outstanding", key="shares_outstanding_backfill_button", disabled=so_running):
+        _start_shares_outstanding_backfill_job(
+            force_refresh_all=force_refresh_all, include_screener_fallback=include_screener_fallback
+        )
+        so_job = _latest_shares_outstanding_backfill_job()
+        so_running = True
+    if so_job:
+        so_status = str(so_job.get("status"))
+        if so_status == "running":
+            so_progress = so_job.get("progress") or {}
+            st.info(
+                f"{_humanize_phase(str(so_progress.get('phase', '')))}... "
+                f"{so_progress.get('completed', 0)}/{so_progress.get('total', 0)}"
             )
-        elif mc_status == "failed":
-            st.error(f"Market cap backfill failed: {market_cap_job.get('error')}")
+            st_autorefresh(interval=2500, limit=None, key="shares_outstanding_backfill_autorefresh")
+        elif so_status == "completed":
+            so_result = so_job.get("result") or {}
+            st.success(
+                f"Done: {so_result.get('nse_resolved_count', 0)}/{so_result.get('nse_candidate_count', 0)} "
+                f"resolved via NSE ({so_result.get('nse_isin_cross_referenced_count', 0)} via BSE↔ISIN "
+                f"cross-reference), {so_result.get('screener_updated_count', 0)} via screener.in fallback, "
+                f"{so_result.get('still_missing_count', 0)} still missing. "
+                f"Market cap recomputed for {so_result.get('market_cap_recomputed_count', 0)} tickers."
+            )
+        elif so_status == "failed":
+            st.error(f"Shares outstanding backfill failed: {so_job.get('error')}")
 
 
 @st.fragment
 def _render_price_cache_fill_status() -> None:
-    # Same fragment-scoping reason as _render_market_cap_backfill_status above.
+    # Same fragment-scoping reason as _render_shares_outstanding_backfill_status above.
     price_fill_job = _latest_price_cache_fill_job()
     price_fill_running = bool(price_fill_job and price_fill_job.get("status") == "running")
     if st.button("Refresh price cache", key="price_cache_fill_button", disabled=price_fill_running):
@@ -187,9 +269,12 @@ def _render_price_cache_fill_status() -> None:
         pf_status = str(price_fill_job.get("status"))
         if pf_status == "running":
             pf_progress = price_fill_job.get("progress") or {}
+            live_metrics_so_far = pf_progress.get("live_metrics_updated_total")
+            live_metrics_suffix = f" · live metrics updated for {live_metrics_so_far}" if live_metrics_so_far else ""
             st.info(
-                f"Refreshing from {pf_progress.get('source', '?')}... phase={pf_progress.get('phase', '?')} "
+                f"{_humanize_phase(str(pf_progress.get('phase', '')))}... "
                 f"{pf_progress.get('completed', 0)}/{pf_progress.get('total', 0)}"
+                f"{_batch_progress_suffix(pf_progress)}{live_metrics_suffix}"
             )
             st_autorefresh(interval=2500, limit=None, key="price_cache_fill_autorefresh")
         elif pf_status == "completed":
@@ -206,6 +291,27 @@ def _render_price_cache_fill_status() -> None:
                     f"Bhavcopy fallback: {pf_result.get('bhavcopy_fallback_recovered_count', 0)} recovered "
                     f"with real history, {pf_result.get('dormant_marked_count', 0)} marked dormant "
                     f"(active=0, no trades since {pf_result.get('start_date', 'the configured floor')})."
+                )
+            if pf_result.get("backfill_exhausted_marked_count") or pf_result.get("backfill_exhausted_skipped_count"):
+                st.caption(
+                    f"{pf_result.get('backfill_exhausted_marked_count', 0)} confirmed as having no data "
+                    f"before {pf_result.get('start_date', 'the configured floor')} — won't be re-attempted "
+                    f"until that date changes ({pf_result.get('backfill_exhausted_skipped_count', 0)} such "
+                    "tickers already skipped this run)."
+                )
+            if pf_result.get("forward_fetch_pending_dormancy_check_count"):
+                st.caption(
+                    f"{pf_result.get('forward_fetch_pending_dormancy_check_count', 0)} tickers are behind on "
+                    "the latest trading day but not yet marked dormant — mostly illiquid/SME stocks with no "
+                    "recent trade. These are auto-confirmed against official exchange records and marked "
+                    f"dormant only after {pf_result.get('forward_fetch_stale_days', 30)} days with nothing "
+                    "new, so a similar forward-updated/failed count recurring across runs is expected while "
+                    "that window plays out, not a sign anything is stuck."
+                )
+            if pf_result.get("live_metrics_updated_count"):
+                st.caption(
+                    f"Live metrics (returns, 52-week high/low) recomputed for "
+                    f"{pf_result.get('live_metrics_updated_count', 0)} tickers this run."
                 )
         elif pf_status == "failed":
             st.error(f"Price cache refresh failed: {price_fill_job.get('error')}")
@@ -234,8 +340,15 @@ with st.sidebar:
         st.success(f"Synced {instrument_master_sync_result.get('synced_ticker_count', 0)} tickers into instrument_master.")
 
     st.divider()
-    st.caption("Backfill market_cap.market_cap via yfinance (per-ticker network call, several minutes for the full universe).")
-    _render_market_cap_backfill_status()
+    st.subheader("Shares Outstanding")
+    st.caption(
+        "Fills market_cap.shares_outstanding from NSE's official shareholding-pattern XBRL "
+        "filings (free, bulk — covers every NSE-listed ticker plus any BSE ticker whose company "
+        "is also NSE-listed, via ISIN). market_cap.market_cap is then recomputed for free from "
+        "this and the already-cached close price on every price-cache refresh — no per-ticker "
+        "network call needed for that part."
+    )
+    _render_shares_outstanding_backfill_status()
 
     st.divider()
     st.subheader("Price History Cache")
