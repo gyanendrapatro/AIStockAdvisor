@@ -15,7 +15,12 @@ from stock_advisor.analysis.indicators import latest_indicators
 from stock_advisor.config.settings import load_watchlists, settings
 from stock_advisor.data.analyst_events import get_analyst_insights, get_stock_events
 from stock_advisor.data.company_intelligence import get_company_intelligence
-from stock_advisor.data.market_data import CACHE_REFRESH_HINT, get_basic_fundamentals, get_price_history
+from stock_advisor.data.market_data import (
+    CACHE_REFRESH_HINT,
+    FUNDAMENTALS_CACHE_REFRESH_HINT,
+    get_basic_fundamentals,
+    get_price_history,
+)
 from stock_advisor.data.news import get_news
 
 # Analyzing a ticker is I/O-bound (price/fundamentals/news are all network fetches), so a
@@ -51,7 +56,7 @@ def analyze_stock(
     fundamentals = get_basic_fundamentals(normalized_ticker)
     has_fundamentals = _has_fundamental_data(fundamentals)
     if not has_fundamentals:
-        warnings.append("No fundamental data returned by market data provider.")
+        warnings.append(f"No fundamentals are cached for {normalized_ticker}. {FUNDAMENTALS_CACHE_REFRESH_HINT}")
 
     news = get_news(normalized_ticker) if include_news else []
     if include_news and not news:

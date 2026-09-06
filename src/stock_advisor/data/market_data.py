@@ -50,6 +50,7 @@ PRICE_CACHE_ENABLED = os.getenv("PRICE_CACHE_ENABLED", "1").strip().lower() not 
 PRICE_CACHE_MAX_AGE_HOURS = float(os.getenv("PRICE_CACHE_MAX_AGE_HOURS", "8"))
 CACHEABLE_INTERVALS = {"1d", "1wk", "1mo"}
 CACHE_REFRESH_HINT = "Refresh the price cache from the sidebar to populate this."
+FUNDAMENTALS_CACHE_REFRESH_HINT = "Refresh the fundamentals cache from the sidebar to populate this."
 
 FUNDAMENTAL_KEYS = [
     "shortName",
@@ -590,6 +591,48 @@ def _ensure_price_cache_schema(conn: sqlite3.Connection) -> None:
         """
     )
     _migrate_live_metrics_columns(conn)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fundamentals_snapshot (
+            ticker_id INTEGER PRIMARY KEY REFERENCES instrument_master(ticker_id),
+            trailing_pe REAL,
+            forward_pe REAL,
+            price_to_book REAL,
+            debt_to_equity REAL,
+            profit_margins REAL,
+            revenue_growth REAL,
+            earnings_growth REAL,
+            return_on_equity REAL,
+            dividend_yield REAL,
+            beta REAL,
+            source TEXT,
+            fetched_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fundamentals_history (
+            ticker_id INTEGER NOT NULL REFERENCES instrument_master(ticker_id),
+            period_type TEXT NOT NULL,
+            period_end_date TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            total_revenue REAL,
+            net_income REAL,
+            ebitda REAL,
+            total_debt REAL,
+            stockholders_equity REAL,
+            total_assets REAL,
+            total_liabilities REAL,
+            operating_cash_flow REAL,
+            eps_diluted REAL,
+            filing_form TEXT,
+            filed_date TEXT,
+            fetched_at TEXT NOT NULL,
+            PRIMARY KEY (ticker_id, period_type, period_end_date, provider)
+        )
+        """
+    )
     _migrate_legacy_ticker_schema(conn)
     conn.execute(
         """
@@ -2570,22 +2613,378 @@ def _current_market_datetime() -> datetime:
     return datetime.now(MARKET_TIMEZONE)
 
 
-def get_basic_fundamentals(ticker: str) -> dict[str, Any]:
-    """Fetch compact free fundamentals plus optional local ownership/governance data."""
-    try:
-        info = yf.Ticker(ticker).info or {}
-    except Exception as exc:
-        logger.warning("Fundamental data fetch failed for %s: %s", ticker, exc)
-        info = {}
-    result = {key: _clean_scalar(info.get(key)) for key in FUNDAMENTAL_KEYS}
-    sources = []
-    if any(value is not None for value in result.values()):
-        sources.append("yfinance")
+# fundamentals_snapshot DB column -> the yfinance-style camelCase key get_basic_fundamentals has
+# always returned (and scoring.py already reads by that name -- e.g. f.get("trailingPE")). Keeping
+# the output contract identical to the old live-fetch version is what let scoring.py, pipeline.py,
+# sector_rotation.py etc. need zero changes when this became a cache read.
+_FUNDAMENTALS_SNAPSHOT_COLUMNS = {
+    "trailing_pe": "trailingPE",
+    "forward_pe": "forwardPE",
+    "price_to_book": "priceToBook",
+    "debt_to_equity": "debtToEquity",
+    "profit_margins": "profitMargins",
+    "revenue_growth": "revenueGrowth",
+    "earnings_growth": "earningsGrowth",
+    "return_on_equity": "returnOnEquity",
+    "dividend_yield": "dividendYield",
+    "beta": "beta",
+}
+# fundamentals_history column -> the flat "sec_*" key scoring.py/pipeline.py already read (only
+# these four are consumed anywhere outside sec_edgar.py itself -- confirmed via search).
+_FUNDAMENTALS_HISTORY_TO_SEC_FIELD = {
+    "total_revenue": "sec_revenue",
+    "net_income": "sec_net_income",
+    "total_liabilities": "sec_liabilities",
+    "stockholders_equity": "sec_equity",
+}
 
-    sec_facts = get_sec_fundamentals(ticker)
-    if sec_facts:
-        sources.extend(sec_facts.pop("_sources", []))
-        result.update(sec_facts)
+
+def store_fundamentals_snapshot(ticker: str, *, source: str, **fields: Any) -> bool:
+    """Upsert one ticker's current-moment fundamentals ratios into fundamentals_snapshot.
+
+    fields are fundamentals_snapshot's own column names (trailing_pe, forward_pe, ...) --
+    see _FUNDAMENTALS_SNAPSHOT_COLUMNS for the mapping back to the yfinance-style keys
+    get_basic_fundamentals returns. Unknown kwargs are ignored (defensive against a caller
+    passing extra fields from a raw yf.Ticker().info dict)."""
+    ticker_key = _cache_ticker(ticker)
+    if not ticker_key:
+        return False
+    columns = list(_FUNDAMENTALS_SNAPSHOT_COLUMNS)
+    values = [fields.get(column) for column in columns]
+    fetched_at = _current_market_datetime().isoformat()
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        ticker_id = _ticker_id(conn, ticker_key, create=True)
+        update_clause = ", ".join(f"{c}=excluded.{c}" for c in columns)
+        conn.execute(
+            f"""
+            INSERT INTO fundamentals_snapshot (ticker_id, {", ".join(columns)}, source, fetched_at)
+            VALUES (?, {", ".join("?" for _ in columns)}, ?, ?)
+            ON CONFLICT(ticker_id) DO UPDATE SET {update_clause}, source=excluded.source, fetched_at=excluded.fetched_at
+            """,
+            (ticker_id, *values, source, fetched_at),
+        )
+        conn.commit()
+    return True
+
+
+def get_fundamentals_snapshot(ticker: str) -> dict[str, Any]:
+    """Pure cache read of fundamentals_snapshot, keyed by the yfinance-style camelCase names
+    get_basic_fundamentals returns. {} if nothing cached yet for this ticker."""
+    ticker_key = _cache_ticker(ticker)
+    if not ticker_key:
+        return {}
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        row = conn.execute(
+            """
+            SELECT fs.* FROM fundamentals_snapshot fs
+            JOIN instrument_master im ON im.ticker_id = fs.ticker_id
+            WHERE im.ticker = ?
+            """,
+            (ticker_key,),
+        ).fetchone()
+    if not row:
+        return {}
+    return {
+        camel_key: row[column]
+        for column, camel_key in _FUNDAMENTALS_SNAPSHOT_COLUMNS.items()
+    }
+
+
+def store_fundamentals_history_rows(ticker: str, rows: list[dict[str, Any]]) -> int:
+    """Bulk upsert historical statement line items into fundamentals_history. Each row needs
+    period_type, period_end_date, provider, plus whichever of total_revenue/net_income/ebitda/
+    total_debt/stockholders_equity/total_assets/total_liabilities/operating_cash_flow/eps_diluted/
+    filing_form/filed_date it has -- missing fields are stored as NULL (deliberately partial rows
+    are fine, e.g. yfinance's quarterly_cashflow coming back empty for some tickers just means
+    that period's row has no operating_cash_flow, not that the whole row is dropped)."""
+    ticker_key = _cache_ticker(ticker)
+    if not ticker_key or not rows:
+        return 0
+    line_item_columns = [
+        "total_revenue", "net_income", "ebitda", "total_debt", "stockholders_equity",
+        "total_assets", "total_liabilities", "operating_cash_flow", "eps_diluted",
+        "filing_form", "filed_date",
+    ]
+    fetched_at = _current_market_datetime().isoformat()
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        ticker_id = _ticker_id(conn, ticker_key, create=True)
+        update_clause = ", ".join(f"{c}=excluded.{c}" for c in line_item_columns)
+        stored = 0
+        for row in rows:
+            period_type = row.get("period_type")
+            period_end_date = row.get("period_end_date")
+            provider = row.get("provider")
+            if not period_type or not period_end_date or not provider:
+                continue
+            values = [row.get(column) for column in line_item_columns]
+            conn.execute(
+                f"""
+                INSERT INTO fundamentals_history
+                (ticker_id, period_type, period_end_date, provider, {", ".join(line_item_columns)}, fetched_at)
+                VALUES (?, ?, ?, ?, {", ".join("?" for _ in line_item_columns)}, ?)
+                ON CONFLICT(ticker_id, period_type, period_end_date, provider) DO UPDATE SET
+                    {update_clause}, fetched_at=excluded.fetched_at
+                """,
+                (ticker_id, period_type, period_end_date, provider, *values, fetched_at),
+            )
+            stored += 1
+        conn.commit()
+    return stored
+
+
+def get_fundamentals_history(ticker: str, *, period_type: str | None = None) -> list[dict[str, Any]]:
+    """Pure cache read of fundamentals_history, ordered by period_end_date ascending (oldest
+    first, matching how a trend chart would want to consume it). period_type=None returns both
+    'annual' and 'quarterly' rows together."""
+    ticker_key = _cache_ticker(ticker)
+    if not ticker_key:
+        return []
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        params: list[Any] = [ticker_key]
+        period_filter = ""
+        if period_type:
+            period_filter = " AND fh.period_type = ?"
+            params.append(period_type)
+        rows = conn.execute(
+            f"""
+            SELECT fh.* FROM fundamentals_history fh
+            JOIN instrument_master im ON im.ticker_id = fh.ticker_id
+            WHERE im.ticker = ?{period_filter}
+            ORDER BY fh.period_end_date ASC
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def compute_fundamentals_ratios(row: dict[str, Any], *, previous_row: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Derive profit_margin/debt_to_equity/roe from one fundamentals_history row (pure
+    computation, no I/O), and revenue_growth when a chronologically-prior row is also given --
+    the same "single source of truth, derive on read" principle live_metrics already follows
+    against price_history_cache, applied here to historical fundamentals instead of prices."""
+    revenue = row.get("total_revenue")
+    net_income = row.get("net_income")
+    equity = row.get("stockholders_equity")
+    debt = row.get("total_debt")
+    ratios: dict[str, Any] = {
+        "profit_margin": (net_income / revenue) if revenue else None,
+        "debt_to_equity": (debt / equity) if equity else None,
+        "roe": (net_income / equity) if equity else None,
+        "revenue_growth": None,
+    }
+    if previous_row is not None:
+        previous_revenue = previous_row.get("total_revenue")
+        if revenue is not None and previous_revenue:
+            ratios["revenue_growth"] = (revenue - previous_revenue) / previous_revenue
+    return ratios
+
+
+_YFINANCE_INCOME_STATEMENT_FIELD_LABELS = {
+    "total_revenue": ("Total Revenue",),
+    "net_income": ("Net Income", "Net Income Common Stockholders"),
+    "ebitda": ("EBITDA",),
+    "eps_diluted": ("Diluted EPS",),
+}
+_YFINANCE_BALANCE_SHEET_FIELD_LABELS = {
+    "total_debt": ("Total Debt",),
+    "stockholders_equity": ("Stockholders Equity",),
+    "total_assets": ("Total Assets",),
+    "total_liabilities": ("Total Liabilities Net Minority Interest",),
+}
+_YFINANCE_CASHFLOW_FIELD_LABELS = {
+    "operating_cash_flow": ("Operating Cash Flow",),
+}
+
+
+def _extract_yfinance_statement_periods(
+    income_stmt: pd.DataFrame, balance_sheet: pd.DataFrame, cashflow: pd.DataFrame, *, period_type: str
+) -> list[dict[str, Any]]:
+    """Merge yfinance's three statement DataFrames (columns = period-end Timestamps, index =
+    line-item labels) into one row per period, keyed by period_end_date. Each statement can have
+    a different (or empty) set of periods -- e.g. quarterly_cashflow is confirmed empty for some
+    tickers -- so periods are unioned across all three rather than requiring all three present."""
+    rows_by_period: dict[str, dict[str, Any]] = {}
+
+    def _collect(df: pd.DataFrame, field_labels: dict[str, tuple[str, ...]]) -> None:
+        if df is None or df.empty:
+            return
+        for column in df.columns:
+            period_end_date = str(column.date()) if hasattr(column, "date") else str(column)
+            row = rows_by_period.setdefault(period_end_date, {"period_end_date": period_end_date})
+            for field, labels in field_labels.items():
+                for label in labels:
+                    if label in df.index:
+                        value = df.loc[label, column]
+                        if pd.notna(value):
+                            row[field] = float(value)
+                        break
+
+    _collect(income_stmt, _YFINANCE_INCOME_STATEMENT_FIELD_LABELS)
+    _collect(balance_sheet, _YFINANCE_BALANCE_SHEET_FIELD_LABELS)
+    _collect(cashflow, _YFINANCE_CASHFLOW_FIELD_LABELS)
+
+    line_item_fields = {
+        *_YFINANCE_INCOME_STATEMENT_FIELD_LABELS,
+        *_YFINANCE_BALANCE_SHEET_FIELD_LABELS,
+        *_YFINANCE_CASHFLOW_FIELD_LABELS,
+    }
+    return [
+        {**row, "period_type": period_type, "provider": "yfinance"}
+        for row in rows_by_period.values()
+        if any(field in row for field in line_item_fields)
+    ]
+
+
+def _extract_sec_fundamentals_periods(sec_facts: dict[str, Any]) -> list[dict[str, Any]]:
+    """get_sec_fundamentals returns each fact (revenue, net income, ...) independently, each with
+    its own _end/_form/_filed -- different facts can legitimately come from different filings, so
+    group them by their own reported period end date into (possibly partial) history rows,
+    instead of assuming they all share one period."""
+    sec_key_to_history_field = {v: k for k, v in _FUNDAMENTALS_HISTORY_TO_SEC_FIELD.items()}
+    rows_by_period: dict[str, dict[str, Any]] = {}
+    for sec_key, history_field in sec_key_to_history_field.items():
+        value = sec_facts.get(sec_key)
+        end = sec_facts.get(f"{sec_key}_end")
+        if value is None or not end:
+            continue
+        form = str(sec_facts.get(f"{sec_key}_form") or "")
+        row = rows_by_period.setdefault(
+            end,
+            {
+                "period_end_date": end,
+                "period_type": "quarterly" if "Q" in form.upper() else "annual",
+                "provider": "sec_edgar",
+                "filing_form": form or None,
+                "filed_date": sec_facts.get(f"{sec_key}_filed"),
+            },
+        )
+        try:
+            row[history_field] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return list(rows_by_period.values())
+
+
+def fill_fundamentals_cache_for_universe(
+    tickers: list[str] | tuple[str, ...], *, progress_callback: Callable[[dict[str, Any]], None] | None = None
+) -> dict[str, Any]:
+    """Fetch and cache fundamentals for every given ticker -- the one place fundamentals are
+    ever fetched from a provider (yfinance .info + statement history, SEC EDGAR for US tickers).
+    get_basic_fundamentals is a pure read of whatever this has stored, exactly mirroring how
+    fill_price_cache_for_universe/get_price_history split fetch from read for prices.
+
+    ownership.yaml / get_ownership_fundamentals is deliberately untouched here -- it's a local
+    file the user maintains by hand, not a provider fetch, so there's nothing to cache."""
+    unique_tickers = list(dict.fromkeys(_cache_ticker(t) for t in tickers if _cache_ticker(t)))
+    total = len(unique_tickers)
+    snapshot_stored_count = 0
+    history_rows_stored_count = 0
+    failed: list[str] = []
+
+    for index, ticker in enumerate(unique_tickers):
+        try:
+            yf_ticker = yf.Ticker(ticker)
+            info = yf_ticker.info or {}
+            if info:
+                store_fundamentals_snapshot(
+                    ticker,
+                    source="yfinance",
+                    **{column: info.get(camel_key) for column, camel_key in _FUNDAMENTALS_SNAPSHOT_COLUMNS.items()},
+                )
+                snapshot_stored_count += 1
+
+            annual_rows = _extract_yfinance_statement_periods(
+                yf_ticker.income_stmt, yf_ticker.balance_sheet, yf_ticker.cashflow, period_type="annual"
+            )
+            quarterly_rows = _extract_yfinance_statement_periods(
+                yf_ticker.quarterly_income_stmt, yf_ticker.quarterly_balance_sheet, yf_ticker.quarterly_cashflow,
+                period_type="quarterly",
+            )
+            sec_facts = get_sec_fundamentals(ticker)
+            sec_rows = _extract_sec_fundamentals_periods(sec_facts) if sec_facts else []
+
+            history_rows_stored_count += store_fundamentals_history_rows(ticker, annual_rows + quarterly_rows + sec_rows)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Fundamentals cache fetch failed for %s: %s", ticker, exc)
+            failed.append(ticker)
+
+        if progress_callback:
+            progress_callback({"phase": "fetching_fundamentals", "completed": index + 1, "total": total})
+
+    return {
+        "requested_ticker_count": total,
+        "snapshot_stored_count": snapshot_stored_count,
+        "history_rows_stored_count": history_rows_stored_count,
+        "failed_count": len(failed),
+        "failed_tickers": failed[:50],
+    }
+
+
+def get_basic_fundamentals(ticker: str) -> dict[str, Any]:
+    """Read cached fundamentals for a ticker -- current ratios (fundamentals_snapshot), the
+    latest SEC EDGAR history row (mapped back to the flat sec_revenue/sec_net_income/
+    sec_liabilities/sec_equity keys scoring.py reads), plus name/sector/industry/market cap from
+    their existing homes (instrument_master/security_classification/market_cap) so those output
+    keys stay populated without duplicating that data into a new table.
+
+    Pure read -- never calls a provider. The only place fundamentals are ever fetched is
+    fill_fundamentals_cache_for_universe(), triggered from the sidebar's "Refresh fundamentals
+    cache" button. If nothing is cached yet for this ticker, the numeric fields come back None —
+    callers should surface FUNDAMENTALS_CACHE_REFRESH_HINT to the user.
+
+    get_ownership_fundamentals (local ownership.yaml/CSV) is still called directly here -- it's
+    an instant local file read, not a provider fetch, so it was never part of the caching problem.
+    """
+    ticker_key = _cache_ticker(ticker)
+    result: dict[str, Any] = {key: None for key in FUNDAMENTAL_KEYS}
+    sources: list[str] = []
+
+    if ticker_key:
+        with _price_cache_connection() as conn:
+            _ensure_price_cache_schema(conn)
+            ticker_id = _ticker_id(conn, ticker_key)
+            if ticker_id is not None:
+                identity_row = conn.execute(
+                    """
+                    SELECT im.name, sc.sector, sc.industry, mc.market_cap
+                    FROM instrument_master im
+                    LEFT JOIN security_classification sc ON sc.ticker_id = im.ticker_id
+                    LEFT JOIN market_cap mc ON mc.ticker_id = im.ticker_id
+                    WHERE im.ticker_id = ?
+                    """,
+                    (ticker_id,),
+                ).fetchone()
+                if identity_row:
+                    result["shortName"] = identity_row["name"]
+                    result["sector"] = identity_row["sector"]
+                    result["industry"] = identity_row["industry"]
+                    result["marketCap"] = identity_row["market_cap"]
+
+                snapshot_row = conn.execute(
+                    "SELECT * FROM fundamentals_snapshot WHERE ticker_id = ?", (ticker_id,)
+                ).fetchone()
+                if snapshot_row:
+                    for column, camel_key in _FUNDAMENTALS_SNAPSHOT_COLUMNS.items():
+                        result[camel_key] = snapshot_row[column]
+                    sources.append("yfinance")
+
+                latest_sec_row = conn.execute(
+                    """
+                    SELECT * FROM fundamentals_history
+                    WHERE ticker_id = ? AND provider = 'sec_edgar'
+                    ORDER BY period_end_date DESC LIMIT 1
+                    """,
+                    (ticker_id,),
+                ).fetchone()
+                if latest_sec_row:
+                    for history_field, sec_field in _FUNDAMENTALS_HISTORY_TO_SEC_FIELD.items():
+                        if latest_sec_row[history_field] is not None:
+                            result[sec_field] = latest_sec_row[history_field]
+                    sources.append("sec_edgar")
 
     ownership = get_ownership_fundamentals(ticker)
     if ownership:

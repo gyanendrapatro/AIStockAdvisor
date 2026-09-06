@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 
 from stock_advisor.data import market_data
 
@@ -976,52 +977,57 @@ def test_load_stock_universe_from_db_excludes_dormant_by_default(tmp_path, monke
     assert "DEAD.NS" in set(everyone_df["ticker"])
 
 
-def test_fundamentals_merge_sec_facts(monkeypatch):
-    class FakeTicker:
-        def __init__(self, ticker):
-            self.ticker = ticker
+def test_get_basic_fundamentals_reads_from_cache_not_live(tmp_path, monkeypatch):
+    """get_basic_fundamentals is a pure cache read -- must never call a provider, matching
+    get_price_history's contract."""
+    monkeypatch.setattr(market_data.settings, "db_path", tmp_path / "cache.sqlite")
 
-        @property
-        def info(self):
-            return {"shortName": "Example Inc.", "trailingPE": 20}
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("get_basic_fundamentals must not call a provider")
 
-    monkeypatch.setattr(market_data.yf, "Ticker", FakeTicker)
-    monkeypatch.setattr(
-        market_data,
-        "get_sec_fundamentals",
-        lambda ticker: {"_sources": ["sec_edgar"], "sec_cik": "0000000001", "sec_revenue": 1000},
-    )
+    monkeypatch.setattr(market_data.yf, "Ticker", _must_not_be_called)
+    monkeypatch.setattr(market_data, "get_sec_fundamentals", _must_not_be_called)
     monkeypatch.setattr(market_data, "get_ownership_fundamentals", lambda ticker: {})
 
-    result = market_data.get_basic_fundamentals("AAPL")
+    with market_data._price_cache_connection() as conn:
+        market_data._ensure_price_cache_schema(conn)
+        conn.execute(
+            "INSERT INTO instrument_master (ticker, market, name, active) VALUES ('EXAMPLE.NS', 'IN', 'Example Inc.', 1)"
+        )
+        conn.commit()
+    market_data.store_fundamentals_snapshot("EXAMPLE.NS", source="yfinance", trailing_pe=20.0, debt_to_equity=45.5)
+
+    result = market_data.get_basic_fundamentals("EXAMPLE.NS")
 
     assert result["shortName"] == "Example Inc."
-    assert result["sec_revenue"] == 1000
-    assert result["_sources"] == ["yfinance", "sec_edgar"]
+    assert result["trailingPE"] == 20.0
+    assert result["debtToEquity"] == 45.5
+    assert result["_sources"] == ["yfinance"]
 
 
-def test_fundamentals_merge_local_ownership(monkeypatch):
-    class FakeTicker:
-        def __init__(self, ticker):
-            self.ticker = ticker
-
-        @property
-        def info(self):
-            return {"shortName": "Example Ltd.", "trailingPE": 24}
-
-    monkeypatch.setattr(market_data.yf, "Ticker", FakeTicker)
-    monkeypatch.setattr(market_data, "get_sec_fundamentals", lambda ticker: {})
+def test_get_basic_fundamentals_reads_sec_history_and_ownership(tmp_path, monkeypatch):
+    monkeypatch.setattr(market_data.settings, "db_path", tmp_path / "cache.sqlite")
     monkeypatch.setattr(
         market_data,
         "get_ownership_fundamentals",
         lambda ticker: {"_sources": ["local_ownership"], "promoter_holding": 55, "promoter_pledge": 0},
     )
 
+    with market_data._price_cache_connection() as conn:
+        market_data._ensure_price_cache_schema(conn)
+        market_data._ticker_id(conn, "RELIANCE.NS", create=True)  # IICS seed may have already created this row
+        conn.commit()
+    market_data.store_fundamentals_history_rows(
+        "RELIANCE.NS",
+        [{"period_type": "annual", "period_end_date": "2026-03-31", "provider": "sec_edgar", "total_revenue": 1000.0}],
+    )
+
     result = market_data.get_basic_fundamentals("RELIANCE.NS")
 
+    assert result["sec_revenue"] == 1000.0
     assert result["promoter_holding"] == 55
     assert result["promoter_pledge"] == 0
-    assert result["_sources"] == ["yfinance", "local_ownership"]
+    assert result["_sources"] == ["sec_edgar", "local_ownership"]
 
 
 def test_refresh_live_metrics_computes_all_return_windows(tmp_path, monkeypatch):
@@ -1187,3 +1193,158 @@ def test_fill_price_cache_for_universe_reports_live_metrics_updated_total(tmp_pa
     live_metrics_totals = [u["live_metrics_updated_total"] for u in progress_updates if u.get("phase") == "full_fetch"]
     assert live_metrics_totals == [1, 2]  # cumulative across the two chunk_size=1 chunks
     assert result["live_metrics_updated_count"] == 2
+
+
+def test_store_and_get_fundamentals_snapshot_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setattr(market_data.settings, "db_path", tmp_path / "cache.sqlite")
+
+    market_data.store_fundamentals_snapshot(
+        "SNAP.NS", source="yfinance", trailing_pe=20.0, debt_to_equity=45.0, beta=1.2
+    )
+    result = market_data.get_fundamentals_snapshot("SNAP.NS")
+
+    assert result["trailingPE"] == 20.0
+    assert result["debtToEquity"] == 45.0
+    assert result["beta"] == 1.2
+    assert result["forwardPE"] is None  # never set -- stays NULL, not missing
+
+    # Upsert: a second call overwrites in place, not a duplicate row.
+    market_data.store_fundamentals_snapshot("SNAP.NS", source="yfinance", trailing_pe=22.0)
+    result = market_data.get_fundamentals_snapshot("SNAP.NS")
+    assert result["trailingPE"] == 22.0
+
+    assert market_data.get_fundamentals_snapshot("NEVERCACHED.NS") == {}
+
+
+def test_store_and_get_fundamentals_history_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setattr(market_data.settings, "db_path", tmp_path / "cache.sqlite")
+
+    stored = market_data.store_fundamentals_history_rows(
+        "HIST.NS",
+        [
+            {"period_type": "annual", "period_end_date": "2025-03-31", "provider": "yfinance", "total_revenue": 900.0},
+            {"period_type": "annual", "period_end_date": "2026-03-31", "provider": "yfinance", "total_revenue": 1000.0},
+            {"period_type": "quarterly", "period_end_date": "2026-06-30", "provider": "yfinance", "total_revenue": 260.0},
+            {"period_type": "annual", "period_end_date": "2026-03-31", "provider": "sec_edgar", "total_revenue": 1005.0},
+        ],
+    )
+    assert stored == 4
+
+    all_rows = market_data.get_fundamentals_history("HIST.NS")
+    assert [r["period_end_date"] for r in all_rows] == ["2025-03-31", "2026-03-31", "2026-03-31", "2026-06-30"]  # ordered
+
+    annual_only = market_data.get_fundamentals_history("HIST.NS", period_type="annual")
+    assert len(annual_only) == 3
+    assert all(r["period_type"] == "annual" for r in annual_only)
+
+    # Upsert: re-storing the same (ticker, period_type, period_end_date, provider) key updates in place.
+    market_data.store_fundamentals_history_rows(
+        "HIST.NS",
+        [{"period_type": "annual", "period_end_date": "2026-03-31", "provider": "yfinance", "total_revenue": 1111.0}],
+    )
+    all_rows = market_data.get_fundamentals_history("HIST.NS")
+    assert len(all_rows) == 4  # still 4, not 5
+    updated = next(r for r in all_rows if r["period_end_date"] == "2026-03-31" and r["provider"] == "yfinance")
+    assert updated["total_revenue"] == 1111.0
+
+
+def test_compute_fundamentals_ratios():
+    row = {"total_revenue": 1000.0, "net_income": 100.0, "stockholders_equity": 500.0, "total_debt": 300.0}
+
+    ratios = market_data.compute_fundamentals_ratios(row)
+    assert ratios["profit_margin"] == 0.1
+    assert ratios["debt_to_equity"] == 0.6
+    assert ratios["roe"] == 0.2
+    assert ratios["revenue_growth"] is None  # no previous_row given
+
+    previous_row = {"total_revenue": 800.0}
+    ratios = market_data.compute_fundamentals_ratios(row, previous_row=previous_row)
+    assert ratios["revenue_growth"] == pytest.approx(0.25)
+
+
+def _fake_statement(labels_values: dict, period: str) -> pd.DataFrame:
+    column = pd.Timestamp(period)
+    return pd.DataFrame({column: pd.Series(labels_values)})
+
+
+def test_fill_fundamentals_cache_for_universe(tmp_path, monkeypatch):
+    monkeypatch.setattr(market_data.settings, "db_path", tmp_path / "cache.sqlite")
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.ticker = ticker
+
+        @property
+        def info(self):
+            return {"trailingPE": 20.0, "debtToEquity": 45.0, "beta": 1.2}
+
+        @property
+        def income_stmt(self):
+            return _fake_statement(
+                {"Total Revenue": 1000.0, "Net Income": 100.0, "EBITDA": 200.0, "Diluted EPS": 5.0}, "2026-03-31"
+            )
+
+        @property
+        def balance_sheet(self):
+            return _fake_statement(
+                {
+                    "Total Debt": 300.0, "Stockholders Equity": 500.0, "Total Assets": 900.0,
+                    "Total Liabilities Net Minority Interest": 400.0,
+                },
+                "2026-03-31",
+            )
+
+        @property
+        def cashflow(self):
+            return _fake_statement({"Operating Cash Flow": 150.0}, "2026-03-31")
+
+        # Confirmed real-world case (RELIANCE.NS): quarterly_cashflow can come back empty --
+        # must not crash the fetch, just contribute fewer fields to that period's row.
+        @property
+        def quarterly_income_stmt(self):
+            return pd.DataFrame()
+
+        @property
+        def quarterly_balance_sheet(self):
+            return pd.DataFrame()
+
+        @property
+        def quarterly_cashflow(self):
+            return pd.DataFrame()
+
+    monkeypatch.setattr(market_data.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(market_data, "get_sec_fundamentals", lambda ticker: {})
+
+    progress_updates = []
+    result = market_data.fill_fundamentals_cache_for_universe(
+        ["FUNDCO.NS"], progress_callback=lambda u: progress_updates.append(dict(u))
+    )
+
+    assert result["snapshot_stored_count"] == 1
+    assert result["history_rows_stored_count"] == 1  # one merged annual period; no quarterly rows
+    assert result["failed_count"] == 0
+    assert progress_updates[-1]["completed"] == 1
+
+    snapshot = market_data.get_fundamentals_snapshot("FUNDCO.NS")
+    assert snapshot["trailingPE"] == 20.0
+
+    history = market_data.get_fundamentals_history("FUNDCO.NS")
+    assert len(history) == 1
+    assert history[0]["total_revenue"] == 1000.0
+    assert history[0]["total_debt"] == 300.0
+    assert history[0]["operating_cash_flow"] == 150.0
+
+
+def test_fill_fundamentals_cache_for_universe_tolerates_provider_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(market_data.settings, "db_path", tmp_path / "cache.sqlite")
+
+    def _raise(ticker):
+        raise RuntimeError("yahoo unavailable")
+
+    monkeypatch.setattr(market_data.yf, "Ticker", _raise)
+
+    result = market_data.fill_fundamentals_cache_for_universe(["BROKEN.NS"])
+
+    assert result["failed_count"] == 1
+    assert result["failed_tickers"] == ["BROKEN.NS"]
+    assert result["snapshot_stored_count"] == 0

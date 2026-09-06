@@ -37,6 +37,7 @@ from stock_advisor.data.daily_refresh import load_daily_refresh_report, run_dail
 from stock_advisor.data.market_data import (
     CACHE_REFRESH_HINT,
     backfill_shares_outstanding,
+    fill_fundamentals_cache_for_universe,
     fill_price_cache_for_universe,
     get_price_cache_status,
     get_price_history,
@@ -163,6 +164,53 @@ def _start_price_cache_fill_job() -> dict[str, object]:
     return job
 
 
+@st.cache_resource
+def _fundamentals_cache_fill_jobs() -> dict[str, dict[str, object]]:
+    return {}
+
+
+def _latest_fundamentals_cache_fill_job() -> dict[str, object] | None:
+    jobs = [job for job in _fundamentals_cache_fill_jobs().values() if job.get("scope") == "fundamentals_cache_fill"]
+    if not jobs:
+        return None
+    return sorted(jobs, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
+
+
+def _start_fundamentals_cache_fill_job() -> dict[str, object]:
+    jobs = _fundamentals_cache_fill_jobs()
+    for job in jobs.values():
+        if job.get("scope") == "fundamentals_cache_fill" and job.get("status") == "running":
+            return job
+
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    job: dict[str, object] = {
+        "id": job_id,
+        "scope": "fundamentals_cache_fill",
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "progress": {"phase": "starting", "completed": 0, "total": 0},
+    }
+    jobs[job_id] = job
+
+    def _on_progress(update: dict[str, object]) -> None:
+        job["progress"] = update
+
+    def _runner() -> None:
+        try:
+            tickers = list_all_instrument_master_tickers()
+            result = fill_fundamentals_cache_for_universe(tickers, progress_callback=_on_progress)
+            job["status"] = "completed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["result"] = result
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = "failed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["error"] = str(exc)
+
+    threading.Thread(target=_runner, name=f"fundamentals-cache-fill-{job_id}", daemon=True).start()
+    return job
+
+
 # Internal phase tokens (from fill_price_cache_for_universe / backfill_shares_outstanding's
 # progress_callback) mapped to plain-language status text. Numbers after each phase are a
 # progress count, not always a ticker count — bhavcopy phases count trading days scanned (one
@@ -176,6 +224,7 @@ _PHASE_LABELS = {
     "bhavcopy_fallback_scanning_days": "Double-checking exchange archives for tickers Yahoo couldn't fetch",
     "shares_outstanding_nse": "Checking NSE shareholding filings",
     "shares_outstanding_screener": "Checking screener.in (fallback)",
+    "fetching_fundamentals": "Fetching fundamentals (Yahoo + SEC EDGAR)",
 }
 
 
@@ -317,6 +366,35 @@ def _render_price_cache_fill_status() -> None:
             st.error(f"Price cache refresh failed: {price_fill_job.get('error')}")
 
 
+@st.fragment
+def _render_fundamentals_cache_fill_status() -> None:
+    # Same fragment-scoping reason as _render_shares_outstanding_backfill_status above.
+    ff_job = _latest_fundamentals_cache_fill_job()
+    ff_running = bool(ff_job and ff_job.get("status") == "running")
+    if st.button("Refresh fundamentals cache", key="fundamentals_cache_fill_button", disabled=ff_running):
+        _start_fundamentals_cache_fill_job()
+        ff_job = _latest_fundamentals_cache_fill_job()
+        ff_running = True
+    if ff_job:
+        ff_status = str(ff_job.get("status"))
+        if ff_status == "running":
+            ff_progress = ff_job.get("progress") or {}
+            st.info(
+                f"{_humanize_phase(str(ff_progress.get('phase', '')))}... "
+                f"{ff_progress.get('completed', 0)}/{ff_progress.get('total', 0)}"
+            )
+            st_autorefresh(interval=2500, limit=None, key="fundamentals_cache_fill_autorefresh")
+        elif ff_status == "completed":
+            ff_result = ff_job.get("result") or {}
+            st.success(
+                f"Done: {ff_result.get('snapshot_stored_count', 0)} current snapshots, "
+                f"{ff_result.get('history_rows_stored_count', 0)} historical statement rows stored, "
+                f"{ff_result.get('failed_count', 0)} failed."
+            )
+        elif ff_status == "failed":
+            st.error(f"Fundamentals cache refresh failed: {ff_job.get('error')}")
+
+
 with st.sidebar:
     st.subheader("Instrument Master")
     st.caption("Consolidate data/*.csv NSE/BSE universes into the instrument_master security table.")
@@ -360,6 +438,17 @@ with st.sidebar:
         "from — everywhere else in the app just reads what's cached here."
     )
     _render_price_cache_fill_status()
+
+    st.divider()
+    st.subheader("Fundamentals Cache")
+    st.caption(
+        "Fills fundamentals_snapshot (current PE/debt-equity/margins/ROE/beta/etc.) and "
+        "fundamentals_history (yfinance's ~5 years annual / ~5 quarters historical statements, "
+        "plus SEC EDGAR for US tickers) for every instrument_master ticker. Stock Scan reads "
+        "only from this cache — this is the only place fundamentals are ever fetched from a "
+        "provider."
+    )
+    _render_fundamentals_cache_fill_status()
 
 
 st.markdown(
