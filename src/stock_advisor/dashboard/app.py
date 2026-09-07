@@ -1426,7 +1426,13 @@ with stock_tab:
     watchlists = load_watchlists()
     c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1.2])
     group = c1.selectbox("Watchlist", ["all"] + list(watchlists.keys()))
-    period = c2.selectbox("Period", ["3mo", "6mo", "1y", "2y"], index=1)
+    period = c2.selectbox(
+        "Period",
+        ["1y", "2y"],
+        index=0,
+        help="1y is the floor: _technical_score weights price-vs-200DMA, 50DMA-vs-200DMA, and the "
+        "50/200-day crossover signal, all of which need 200 trading days of history to compute at all.",
+    )
     interval = c3.selectbox("Interval", ["1d", "1wk"], index=0)
     include_news = c4.checkbox("Include news sentiment", value=True)
     c1, c2, c3 = st.columns([1, 2.2, 1])
@@ -1538,11 +1544,15 @@ with sector_tab:
     c1, c2, c3, c4 = st.columns(4)
     sector_period_choice = c1.selectbox(
         "Sector period",
-        ["Auto", "6mo", "1y", "2y"],
+        ["Auto", "1y", "2y"],
         index=0,
         help=(
             "Historical window for sector movement. Auto uses fresh 1y price history and compares "
-            "5D, 20D, 60D, and 120D movement, relative strength, trend, acceleration, and breadth."
+            "5D, 20D, 60D, and 120D movement, relative strength, trend, acceleration, and breadth. "
+            "1y is the floor: the 200-day moving average (a major input to trend_score and to the "
+            "Leadership/Pullback in uptrend/Weak-Avoid stages) needs 200 trading days of history to "
+            "compute at all -- a shorter window used to be offered here but silently left those "
+            "stages unreachable and dropped SMA200 out of the trend score with no warning."
         ),
     )
     sector_auto_period = sector_period_choice == "Auto"
@@ -2675,7 +2685,14 @@ with industry_tab:
         "Configured industry groups": "local",
     }[industry_universe_label]
     c1, c2, c3, c4 = st.columns(4)
-    industry_period = c1.selectbox("Industry period", ["6mo", "1y", "2y"], index=1, key="industry_period")
+    industry_period = c1.selectbox(
+        "Industry period",
+        ["1y", "2y"],
+        index=0,
+        key="industry_period",
+        help="1y is the floor: trend_score and breadth_score both weight the 200-day moving "
+        "average, which needs 200 trading days of history to compute at all.",
+    )
     industry_interval = c2.selectbox("Industry interval", ["1d", "1wk"], index=0, key="industry_interval")
     industry_min_stocks = c3.slider("Minimum stocks", min_value=2, max_value=12, value=3)
     industry_weighting = c4.selectbox("Weighting", ["equal", "market_cap"], index=0)
@@ -2846,7 +2863,13 @@ with indices_tab:
     st.subheader("Market Indices")
     st.caption("Broad and sector index performance with relative strength, trend health, and RRG-style rotation.")
     c1, c2, c3 = st.columns([1, 1, 1.2])
-    indices_period = c1.selectbox("Index period", ["6mo", "1y", "2y"], index=1)
+    indices_period = c1.selectbox(
+        "Index period",
+        ["1y", "2y"],
+        index=0,
+        help="1y is the floor: trend_score weights the 200-day moving average, which needs 200 "
+        "trading days of history to compute at all.",
+    )
     indices_interval = c2.selectbox("Index interval", ["1d", "1wk"], index=0)
     run_indices = c3.button("Run market indices")
 
@@ -2935,7 +2958,13 @@ with breadth_tab:
     st.subheader("Market Breadth")
     st.caption("Participation view: how many configured stocks are above moving averages, positive over recent windows, and near highs.")
     c1, c2, c3 = st.columns([1, 1, 1.2])
-    breadth_period = c1.selectbox("Breadth period", ["6mo", "1y", "2y"], index=1)
+    breadth_period = c1.selectbox(
+        "Breadth period",
+        ["1y", "2y"],
+        index=0,
+        help="1y is the floor: this view's whole purpose is counting stocks above 20/50/200 DMA, "
+        "and the 200-day moving average needs 200 trading days of history to compute at all.",
+    )
     breadth_interval = c2.selectbox("Breadth interval", ["1d", "1wk"], index=0)
     breadth_limit = c3.slider("Max stocks", min_value=20, max_value=120, value=80)
     run_breadth = st.button("Run market breadth")
