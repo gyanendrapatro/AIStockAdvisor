@@ -20,6 +20,7 @@ from stock_advisor.data.exchange_eod import (
     get_exchange_eod_rows_for_date,
     get_latest_exchange_eod_rows,
 )
+from stock_advisor.data.nse_indices import _fetch_daily_index_archive, resolve_nse_index_name
 from stock_advisor.data.nse_shareholding import (
     build_shareholding_index,
     default_sme_lookback_from_date,
@@ -3007,3 +3008,651 @@ def _clean_scalar(value: Any) -> Any:
         except Exception:
             return value
     return value
+
+
+# ---------------------------------------------------------------------------
+# Turnaround Scanner Export
+# ---------------------------------------------------------------------------
+# Read-only export helpers backing the "Turnaround Scanner Export" dashboard tab.
+# These never fetch from a provider or write to the cache -- they only shape what's
+# already in instrument_master / price_history_cache / security_classification /
+# market_cap / price_data into CSV-ready rows for an external quant pipeline. No
+# turnaround score, signal, or technical indicator is computed here -- that's left
+# entirely to the downstream scanner.
+
+EXPORT_CHUNK_SIZE = 5000
+# The only benchmark actually persisted in price_history_cache -- matches the "Nifty 50"
+# label app.py's RRG tab already uses for ^NSEI (rrg_benchmark_options). Sector indices
+# (NIFTY BANK/IT/...) are fetched live by nse_indices.py and never written to sqlite, so
+# they can't be offered here without a schema change.
+EXPORT_BENCHMARK_TICKERS: dict[str, str] = {"^NSEI": "Nifty 50"}
+
+
+def _export_universe_where(
+    *,
+    exchanges: list[str] | None = None,
+    sector: str | None = None,
+    industry: str | None = None,
+    market_cap_min: float | None = None,
+    market_cap_max: float | None = None,
+    active_only: bool = False,
+    symbols: list[str] | None = None,
+) -> tuple[str, list[Any]]:
+    """Shared WHERE-clause builder for every export query below, so the universe filter
+    semantics (exchange/sector/industry/market-cap/active/symbols) stay identical across
+    the OHLCV, scanner-dataset, and security-master exports. Assumes aliases
+    im=instrument_master, sc=security_classification, mc=market_cap."""
+    clauses: list[str] = ["im.market = 'IN'"]
+    params: list[Any] = []
+    if exchanges:
+        clauses.append(f"im.exchange IN ({','.join('?' for _ in exchanges)})")
+        params.extend(exchanges)
+    if sector:
+        clauses.append("sc.sector = ?")
+        params.append(sector)
+    if industry:
+        clauses.append("sc.industry = ?")
+        params.append(industry)
+    if market_cap_min is not None:
+        clauses.append("mc.market_cap >= ?")
+        params.append(market_cap_min)
+    if market_cap_max is not None:
+        clauses.append("mc.market_cap <= ?")
+        params.append(market_cap_max)
+    if active_only:
+        clauses.append("im.active IS NOT 0")
+    if symbols:
+        cleaned = [str(s).strip().upper() for s in symbols if str(s).strip()]
+        if cleaned:
+            clauses.append(f"im.symbol IN ({','.join('?' for _ in cleaned)})")
+            params.extend(cleaned)
+    return " AND ".join(clauses), params
+
+
+def _export_date_where(start_date: str | None, end_date: str | None) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if start_date:
+        clauses.append("phc.date >= ?")
+        params.append(str(start_date))
+    if end_date:
+        clauses.append("phc.date <= ?")
+        params.append(str(end_date))
+    return (" AND " + " AND ".join(clauses)) if clauses else "", params
+
+
+def get_turnaround_export_coverage() -> dict[str, Any]:
+    """One-pass data-coverage and data-quality snapshot for the Turnaround Scanner Export
+    tab's "Data Coverage" section. Duplicate (ticker_id, interval, date) rows are
+    structurally impossible in price_history_cache (enforced by its own PRIMARY KEY) but
+    the query still runs for real rather than being hardcoded to 0. Separately, some
+    companies are listed on both NSE and BSE as two distinct instrument_master rows
+    sharing one bare `symbol` -- that can produce duplicate (symbol, date) pairs once the
+    export collapses down to the `symbol` column, which is reported here too since it's
+    the duplicate a downstream (symbol, date)-keyed consumer would actually see."""
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        securities_total = conn.execute("SELECT COUNT(*) FROM instrument_master").fetchone()[0]
+        quality = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_rows,
+                COUNT(DISTINCT ticker_id) AS securities_with_ohlcv,
+                MIN(date) AS earliest_date,
+                MAX(date) AS latest_date,
+                SUM(CASE WHEN high < low THEN 1 ELSE 0 END) AS high_lt_low,
+                SUM(CASE WHEN open > high OR open < low THEN 1 ELSE 0 END) AS open_out_of_range,
+                SUM(CASE WHEN close > high OR close < low THEN 1 ELSE 0 END) AS close_out_of_range,
+                SUM(CASE WHEN open <= 0 OR high <= 0 OR low <= 0 OR close <= 0 THEN 1 ELSE 0 END) AS non_positive_price,
+                SUM(CASE WHEN volume < 0 THEN 1 ELSE 0 END) AS negative_volume,
+                SUM(CASE WHEN open IS NULL OR high IS NULL OR low IS NULL OR close IS NULL OR volume IS NULL
+                          THEN 1 ELSE 0 END) AS missing_ohlcv
+            FROM price_history_cache
+            WHERE interval = '1d'
+            """
+        ).fetchone()
+        duplicate_ticker_date = conn.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT ticker_id, interval, date FROM price_history_cache
+                GROUP BY ticker_id, interval, date HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()[0]
+        duplicate_symbol_date = conn.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT im.symbol, phc.date
+                FROM price_history_cache phc
+                JOIN instrument_master im ON im.ticker_id = phc.ticker_id
+                WHERE phc.interval = '1d' AND im.symbol IS NOT NULL
+                GROUP BY im.symbol, phc.date HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()[0]
+        benchmark_placeholders = ",".join("?" for _ in EXPORT_BENCHMARK_TICKERS)
+        benchmark_count = conn.execute(
+            f"SELECT COUNT(*) FROM instrument_master WHERE ticker IN ({benchmark_placeholders}) AND active IS NOT 0",
+            list(EXPORT_BENCHMARK_TICKERS),
+        ).fetchone()[0]
+
+    invalid_breakdown = {
+        "high_lt_low": int(quality["high_lt_low"] or 0),
+        "open_out_of_range": int(quality["open_out_of_range"] or 0),
+        "close_out_of_range": int(quality["close_out_of_range"] or 0),
+        "non_positive_price": int(quality["non_positive_price"] or 0),
+        "negative_volume": int(quality["negative_volume"] or 0),
+    }
+    return {
+        "securities_total": int(securities_total or 0),
+        "securities_with_ohlcv": int(quality["securities_with_ohlcv"] or 0),
+        "ohlcv_records": int(quality["total_rows"] or 0),
+        "earliest_date": quality["earliest_date"],
+        "latest_date": quality["latest_date"],
+        "duplicate_ticker_date_records": int(duplicate_ticker_date or 0),
+        "duplicate_symbol_date_records": int(duplicate_symbol_date or 0),
+        "invalid_records": sum(invalid_breakdown.values()),
+        "invalid_breakdown": invalid_breakdown,
+        "missing_ohlcv_records": int(quality["missing_ohlcv"] or 0),
+        "adjusted_price_available": False,
+        "benchmark_count": int(benchmark_count or 0),
+    }
+
+
+def list_export_filter_options() -> dict[str, Any]:
+    """Distinct filter values for the Turnaround Scanner Export tab's universe widgets."""
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        exchanges = [
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT exchange FROM instrument_master "
+                "WHERE exchange IS NOT NULL AND market = 'IN' ORDER BY exchange"
+            ).fetchall()
+        ]
+        sectors = [
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT sector FROM security_classification WHERE sector IS NOT NULL ORDER BY sector"
+            ).fetchall()
+        ]
+        # market_cap.market_cap (computed from shares_outstanding x price) is populated for
+        # ~1,500 tickers in this DB; market_cap.free_float_market_cap (only ever loaded from
+        # the "broad"/Nifty Total Market universe refresh) is populated for a handful -- too
+        # sparse to build a usable min/max range filter from, so the filter uses market_cap.
+        cap_row = conn.execute("SELECT MIN(market_cap), MAX(market_cap) FROM market_cap").fetchone()
+    return {
+        "exchanges": exchanges,
+        "sectors": sectors,
+        "market_cap_min": cap_row[0],
+        "market_cap_max": cap_row[1],
+    }
+
+
+def list_export_industries_for_sector(sector: str | None = None) -> list[str]:
+    """Industries for the export tab's dependent industry dropdown, optionally scoped to
+    a chosen sector (mirrors security_classification's sector -> industry grouping)."""
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        if sector:
+            rows = conn.execute(
+                "SELECT DISTINCT industry FROM security_classification "
+                "WHERE industry IS NOT NULL AND sector = ? ORDER BY industry",
+                (sector,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT industry FROM security_classification WHERE industry IS NOT NULL ORDER BY industry"
+            ).fetchall()
+    return [row[0] for row in rows]
+
+
+def get_export_row_count(
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    exchanges: list[str] | None = None,
+    sector: str | None = None,
+    industry: str | None = None,
+    market_cap_min: float | None = None,
+    market_cap_max: float | None = None,
+    active_only: bool = False,
+    symbols: list[str] | None = None,
+) -> int:
+    """Cheap COUNT(*) preview for the export-size warning, run before generating the
+    OHLCV/scanner-dataset CSV. Uses the exact same joins/WHERE as the real export, over
+    the same (ticker_id, interval, date) index, so it stays fast at full-universe scale."""
+    universe_where, universe_params = _export_universe_where(
+        exchanges=exchanges,
+        sector=sector,
+        industry=industry,
+        market_cap_min=market_cap_min,
+        market_cap_max=market_cap_max,
+        active_only=active_only,
+        symbols=symbols,
+    )
+    date_where, date_params = _export_date_where(start_date, end_date)
+    query = f"""
+        SELECT COUNT(*)
+        FROM price_history_cache phc
+        JOIN instrument_master im ON im.ticker_id = phc.ticker_id
+        LEFT JOIN security_classification sc ON sc.ticker_id = im.ticker_id
+        LEFT JOIN market_cap mc ON mc.ticker_id = im.ticker_id
+        WHERE phc.interval = '1d' AND {universe_where}{date_where}
+    """
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        return int(conn.execute(query, universe_params + date_params).fetchone()[0])
+
+
+def stream_ohlcv_export_rows(
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    exchanges: list[str] | None = None,
+    sector: str | None = None,
+    industry: str | None = None,
+    market_cap_min: float | None = None,
+    market_cap_max: float | None = None,
+    active_only: bool = False,
+    symbols: list[str] | None = None,
+):
+    """Yield fetchmany() chunks of sqlite3.Row for the raw OHLCV CSV export (Step 3 schema:
+    symbol, company_name, exchange, isin, date, open, high, low, close, volume -- the
+    caller adds a blank adjusted_close column, since no such data exists in this DB),
+    sorted by symbol then date. Streams straight off a cursor -- never materializes the
+    full result set or a pandas DataFrame, so a full-history/full-universe export doesn't
+    pay double the memory building an intermediate DataFrame before writing it out as CSV."""
+    universe_where, universe_params = _export_universe_where(
+        exchanges=exchanges,
+        sector=sector,
+        industry=industry,
+        market_cap_min=market_cap_min,
+        market_cap_max=market_cap_max,
+        active_only=active_only,
+        symbols=symbols,
+    )
+    date_where, date_params = _export_date_where(start_date, end_date)
+    query = f"""
+        SELECT
+            im.symbol AS symbol, im.name AS company_name, im.exchange AS exchange, im.isin AS isin,
+            phc.date AS date, phc.open AS open, phc.high AS high, phc.low AS low, phc.close AS close,
+            phc.volume AS volume
+        FROM price_history_cache phc
+        JOIN instrument_master im ON im.ticker_id = phc.ticker_id
+        LEFT JOIN security_classification sc ON sc.ticker_id = im.ticker_id
+        LEFT JOIN market_cap mc ON mc.ticker_id = im.ticker_id
+        WHERE phc.interval = '1d' AND {universe_where}{date_where}
+        ORDER BY im.symbol, phc.date
+    """
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        cursor = conn.execute(query, universe_params + date_params)
+        while True:
+            chunk = cursor.fetchmany(EXPORT_CHUNK_SIZE)
+            if not chunk:
+                break
+            yield chunk
+
+
+def stream_scanner_dataset_export_rows(
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    exchanges: list[str] | None = None,
+    sector: str | None = None,
+    industry: str | None = None,
+    market_cap_min: float | None = None,
+    market_cap_max: float | None = None,
+    active_only: bool = False,
+    symbols: list[str] | None = None,
+):
+    """Yield fetchmany() chunks for the primary Turnaround Scanner Dataset export (Step 4
+    schema) -- everything stream_ohlcv_export_rows() has, plus turnover/market_cap/sector/
+    industry. turnover only ever carries a value on each ticker's single latest cached
+    date (price_data is a latest-snapshot table, not historical, so it's NULL on every
+    older row); market_cap/sector/industry are today's classification/snapshot applied to
+    every historical row, not point-in-time history. Both caveats are surfaced to the
+    caller via the export manifest, not hidden."""
+    universe_where, universe_params = _export_universe_where(
+        exchanges=exchanges,
+        sector=sector,
+        industry=industry,
+        market_cap_min=market_cap_min,
+        market_cap_max=market_cap_max,
+        active_only=active_only,
+        symbols=symbols,
+    )
+    date_where, date_params = _export_date_where(start_date, end_date)
+    query = f"""
+        SELECT
+            im.symbol AS symbol, im.name AS company_name, im.exchange AS exchange, im.isin AS isin,
+            phc.date AS date, phc.open AS open, phc.high AS high, phc.low AS low, phc.close AS close,
+            phc.volume AS volume,
+            CASE WHEN pd.date = phc.date THEN pd.turnover ELSE NULL END AS turnover,
+            mc.market_cap AS market_cap, mc.free_float_market_cap AS free_float_market_cap,
+            sc.sector AS sector, sc.industry AS industry
+        FROM price_history_cache phc
+        JOIN instrument_master im ON im.ticker_id = phc.ticker_id
+        LEFT JOIN security_classification sc ON sc.ticker_id = im.ticker_id
+        LEFT JOIN market_cap mc ON mc.ticker_id = im.ticker_id
+        LEFT JOIN price_data pd ON pd.ticker_id = im.ticker_id
+        WHERE phc.interval = '1d' AND {universe_where}{date_where}
+        ORDER BY im.symbol, phc.date
+    """
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        cursor = conn.execute(query, universe_params + date_params)
+        while True:
+            chunk = cursor.fetchmany(EXPORT_CHUNK_SIZE)
+            if not chunk:
+                break
+            yield chunk
+
+
+def get_benchmark_export_rows(*, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
+    """All persisted benchmark OHLCV history (Step 5 schema) -- currently just NIFTY 50
+    (^NSEI). No sector indices are stored in this DB (nse_indices.py fetches them live, on
+    demand, and never persists them), so this can only ever export what's actually
+    cached here; it does not fabricate sector-index rows."""
+    date_where, date_params = _export_date_where(start_date, end_date)
+    placeholders = ",".join("?" for _ in EXPORT_BENCHMARK_TICKERS)
+    query = f"""
+        SELECT im.ticker AS benchmark_symbol, phc.date AS date, phc.open AS open,
+               phc.high AS high, phc.low AS low, phc.close AS close, phc.volume AS volume
+        FROM price_history_cache phc
+        JOIN instrument_master im ON im.ticker_id = phc.ticker_id
+        WHERE phc.interval = '1d' AND im.active IS NOT 0
+          AND im.ticker IN ({placeholders}){date_where}
+        ORDER BY im.ticker, phc.date
+    """
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        rows = conn.execute(query, list(EXPORT_BENCHMARK_TICKERS) + date_params).fetchall()
+    columns = ["benchmark_symbol", "benchmark_name", "benchmark_type", "date", "open", "high", "low", "close", "adjusted_close", "volume"]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame([dict(row) for row in rows])
+    df["benchmark_name"] = df["benchmark_symbol"].map(EXPORT_BENCHMARK_TICKERS).fillna("")
+    df["benchmark_type"] = "MARKET_INDEX"
+    df["adjusted_close"] = None
+    return df[columns]
+
+
+def get_security_master_export_rows(
+    *,
+    exchanges: list[str] | None = None,
+    sector: str | None = None,
+    industry: str | None = None,
+    market_cap_min: float | None = None,
+    market_cap_max: float | None = None,
+    active_only: bool = False,
+    symbols: list[str] | None = None,
+) -> pd.DataFrame:
+    """Security master export (Step 6 schema). No listing_date column exists anywhere in
+    the schema, so it's omitted entirely rather than left blank. market_cap and
+    free_float_market_cap are both the latest synced snapshot, not a historical series."""
+    universe_where, universe_params = _export_universe_where(
+        exchanges=exchanges,
+        sector=sector,
+        industry=industry,
+        market_cap_min=market_cap_min,
+        market_cap_max=market_cap_max,
+        active_only=active_only,
+        symbols=symbols,
+    )
+    query = f"""
+        SELECT im.symbol AS symbol, im.name AS company_name, im.exchange AS exchange, im.isin AS isin,
+               sc.sector AS sector, sc.industry AS industry,
+               mc.market_cap AS market_cap, mc.free_float_market_cap AS free_float_market_cap,
+               im.active AS active
+        FROM instrument_master im
+        LEFT JOIN security_classification sc ON sc.ticker_id = im.ticker_id
+        LEFT JOIN market_cap mc ON mc.ticker_id = im.ticker_id
+        WHERE {universe_where}
+        ORDER BY im.symbol
+    """
+    columns = [
+        "symbol", "company_name", "exchange", "isin", "sector", "industry",
+        "market_cap", "free_float_market_cap", "status",
+    ]
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        rows = conn.execute(query, universe_params).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame([dict(row) for row in rows])
+    df["status"] = df["active"].map(lambda v: "Active" if v == 1 else ("Inactive" if v == 0 else "Unknown"))
+    return df.drop(columns=["active"])[columns]
+
+
+# ---------------------------------------------------------------------------
+# Sector / benchmark index backfill (for the Turnaround Scanner's relative-strength calc)
+# ---------------------------------------------------------------------------
+# NSE's daily index-close archive (nse_indices._fetch_daily_index_archive) returns EVERY NSE
+# index's OHLCV for one day in a single request -- so persisting many indices costs the same
+# number of HTTP requests as persisting one (one request per trading day, not per index). This
+# backfills them into instrument_master/price_history_cache exactly like ^NSEI already lives
+# there, so relative-strength queries stay 100% local afterward. Manually triggered (sidebar
+# button), never auto-run -- matches every other fill_*/backfill_* function in this module.
+#
+# (archive_name, ticker, display_name, benchmark_type). Tickers reuse sector_rotation.
+# SECTOR_DEFINITIONS' existing index_ticker values where one already exists elsewhere in the
+# app (Auto/Bank/FMCG/IT/Metal/Pharma/PSU Bank/Realty/Energy/Infrastructure/Media); the rest are
+# app-internal synthetic identifiers (not claimed to be any vendor's official ticker symbol).
+INDEX_BACKFILL_DEFINITIONS: list[tuple[str, str, str, str]] = [
+    ("Nifty 50", "^NSEI", "Nifty 50", "MARKET_INDEX"),
+    ("Nifty 500", "^CRSLDX", "Nifty 500", "MARKET_INDEX"),
+    ("Nifty Midcap 100", "^NIFTYMDCP100", "Nifty Midcap 100", "MARKET_INDEX"),
+    ("Nifty Smallcap 100", "^NIFTYSMCP100", "Nifty Smallcap 100", "MARKET_INDEX"),
+    ("Nifty Auto", "^CNXAUTO", "Nifty Auto", "SECTOR_INDEX"),
+    ("Nifty Bank", "^NSEBANK", "Nifty Bank", "SECTOR_INDEX"),
+    ("Nifty FMCG", "^CNXFMCG", "Nifty FMCG", "SECTOR_INDEX"),
+    ("Nifty IT", "^CNXIT", "Nifty IT", "SECTOR_INDEX"),
+    ("Nifty Metal", "^CNXMETAL", "Nifty Metal", "SECTOR_INDEX"),
+    ("Nifty Pharma", "^CNXPHARMA", "Nifty Pharma", "SECTOR_INDEX"),
+    ("Nifty PSU Bank", "^CNXPSUBANK", "Nifty PSU Bank", "SECTOR_INDEX"),
+    ("Nifty Realty", "^CNXREALTY", "Nifty Realty", "SECTOR_INDEX"),
+    ("Nifty Energy", "^CNXENERGY", "Nifty Energy", "SECTOR_INDEX"),
+    ("Nifty Infrastructure", "^CNXINFRA", "Nifty Infrastructure", "SECTOR_INDEX"),
+    ("Nifty Media", "^CNXMEDIA", "Nifty Media", "SECTOR_INDEX"),
+    ("Nifty India Consumption", "^CNXCONSUMPTION", "Nifty Consumption", "SECTOR_INDEX"),
+    ("Nifty Oil & Gas", "^CNXOILGAS", "Nifty Oil & Gas", "SECTOR_INDEX"),
+    ("Nifty Chemicals", "^CNXCHEM", "Nifty Chemicals", "SECTOR_INDEX"),
+    ("Nifty Consumer Durables", "^CNXCONSUMDUR", "Nifty Consumer Durables", "SECTOR_INDEX"),
+    ("Nifty Financial Services", "^CNXFINSERV", "Nifty Financial Services", "SECTOR_INDEX"),
+    ("Nifty Healthcare Index", "^CNXHEALTHCARE", "Nifty Healthcare", "SECTOR_INDEX"),
+    ("Nifty Cement", "^CNXCEMENT", "Nifty Cement", "SECTOR_INDEX"),
+]
+
+# security_classification.sector -> archive index name, for stock-vs-sector relative strength.
+# Only sectors with a direct or clearly-reasonable match are mapped; everything else is left out
+# on purpose so sector_rs_3m reports NOT AVAILABLE rather than a forced/misleading comparison.
+SECTOR_TO_INDEX_NAME: dict[str, str] = {
+    "Information Technology": "Nifty IT",
+    "Financial Services": "Nifty Financial Services",
+    "Fast Moving Consumer Goods": "Nifty FMCG",
+    "FMCG": "Nifty FMCG",
+    "Consumer Durables": "Nifty Consumer Durables",
+    "Healthcare": "Nifty Healthcare Index",
+    "Chemicals": "Nifty Chemicals",
+    "Metals & Mining": "Nifty Metal",
+    "Media, Entertainment & Publication": "Nifty Media",
+    "Media Entertainment & Publication": "Nifty Media",
+    "Realty": "Nifty Realty",
+    "Automobile and Auto Components": "Nifty Auto",
+    "Auto": "Nifty Auto",
+    "Oil, Gas & Consumable Fuels": "Nifty Oil & Gas",
+    "Oil, Gas & Consumable fuels": "Nifty Oil & Gas",
+    "Construction Materials": "Nifty Cement",
+    "Construction": "Nifty Infrastructure",  # approximate proxy
+    "Power": "Nifty Energy",  # approximate proxy
+    "Consumer Services": "Nifty India Consumption",  # broad thematic proxy
+}
+
+
+def backfill_sector_benchmark_indices(
+    *,
+    start_date: str = "2024-01-01",
+    end_date: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> dict[str, Any]:
+    """One-time (re-runnable) backfill of sector/benchmark index OHLCV into
+    instrument_master/price_history_cache from NSE's official daily index-close archive.
+    Iterates each weekday once (skipping non-trading days, whose archive fetch just returns
+    empty), extracting every index in INDEX_BACKFILL_DEFINITIONS from that single day's file --
+    so the network cost is O(trading days), not O(trading days x indices). Safe to re-run:
+    INSERT OR REPLACE on (ticker_id, interval, date)."""
+    end = date.fromisoformat(end_date) if end_date else _current_market_datetime().date()
+    start = date.fromisoformat(start_date)
+    trading_days = []
+    cursor = start
+    while cursor <= end:
+        if cursor.weekday() < 5:
+            trading_days.append(cursor)
+        cursor += timedelta(days=1)
+
+    resolved_targets = {resolve_nse_index_name(name).casefold(): (name, ticker, display_name, benchmark_type) for name, ticker, display_name, benchmark_type in INDEX_BACKFILL_DEFINITIONS}
+    buffered_rows: dict[str, list[tuple]] = {ticker: [] for _, ticker, _, _ in INDEX_BACKFILL_DEFINITIONS}
+    days_with_data = 0
+    fetched_at = _current_market_datetime().isoformat()
+
+    for index, trade_date in enumerate(trading_days):
+        daily = _fetch_daily_index_archive(trade_date)
+        if not daily.empty:
+            days_with_data += 1
+            daily = daily.copy()
+            daily["_key"] = daily["index_name"].str.casefold()
+            for key, (archive_name, ticker, display_name, benchmark_type) in resolved_targets.items():
+                match = daily[daily["_key"] == key]
+                if match.empty:
+                    continue
+                row = match.iloc[0]
+                buffered_rows[ticker].append(
+                    (
+                        trade_date.isoformat(),
+                        float(row["open"]),
+                        float(row["high"]),
+                        float(row["low"]),
+                        float(row["close"]),
+                        float(row["volume"]) if pd.notna(row["volume"]) else 0.0,
+                    )
+                )
+        if progress_callback:
+            progress_callback(index + 1, len(trading_days))
+
+    rows_written = 0
+    tickers_written = 0
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        for archive_name, ticker, display_name, benchmark_type in INDEX_BACKFILL_DEFINITIONS:
+            rows = buffered_rows.get(ticker) or []
+            if not rows:
+                continue
+            ticker_id = _ticker_id(conn, ticker, create=True)
+            conn.execute(
+                "UPDATE instrument_master SET name = ?, market = 'IN', source = 'nse_index_archive_backfill', "
+                "active = 1 WHERE ticker_id = ? AND (name IS NULL OR source != 'nse_index_archive_backfill')",
+                (display_name, ticker_id),
+            )
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO price_history_cache
+                (ticker_id, interval, date, open, high, low, close, volume, provider, fetched_at)
+                VALUES (?, '1d', ?, ?, ?, ?, ?, ?, 'nse_index_archive', ?)
+                """,
+                [(ticker_id, r[0], r[1], r[2], r[3], r[4], r[5], fetched_at) for r in rows],
+            )
+            conn.commit()
+            rows_written += len(rows)
+            tickers_written += 1
+
+    return {
+        "trading_days_scanned": len(trading_days),
+        "trading_days_with_data": days_with_data,
+        "indices_backfilled": tickers_written,
+        "indices_targeted": len(INDEX_BACKFILL_DEFINITIONS),
+        "rows_written": rows_written,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+    }
+
+
+def get_scanner_price_frame(
+    *,
+    as_of_date: str,
+    lookback_days: int = 620,
+    exchanges: list[str] | None = None,
+    sector: str | None = None,
+    industry: str | None = None,
+    market_cap_min: float | None = None,
+    market_cap_max: float | None = None,
+    symbols: list[str] | None = None,
+    active_only: bool = False,
+) -> pd.DataFrame:
+    """One bulk, bounded query for the Turnaround Scanner: every matching security's OHLCV from
+    (as_of_date - lookback_days) through as_of_date (inclusive), plus identity/classification
+    columns, in a single pass -- replaces the per-ticker get_price_history loop every other scan
+    function in this app uses (each of which opens its own sqlite connection per ticker). Bounded
+    by date so this stays fast and memory-safe even for the full universe, and never returns rows
+    after as_of_date (the scanner's no-look-ahead guarantee starts here)."""
+    universe_where, universe_params = _export_universe_where(
+        exchanges=exchanges,
+        sector=sector,
+        industry=industry,
+        market_cap_min=market_cap_min,
+        market_cap_max=market_cap_max,
+        active_only=active_only,
+        symbols=symbols,
+    )
+    as_of = date.fromisoformat(str(as_of_date))
+    start = (as_of - timedelta(days=lookback_days)).isoformat()
+    query = f"""
+        SELECT
+            im.ticker_id AS ticker_id, im.ticker AS ticker, im.symbol AS symbol, im.name AS company_name,
+            im.exchange AS exchange, im.isin AS isin, sc.sector AS sector, sc.industry AS industry,
+            mc.market_cap AS market_cap, im.active AS active,
+            phc.date AS date, phc.open AS open, phc.high AS high, phc.low AS low, phc.close AS close,
+            phc.volume AS volume
+        FROM price_history_cache phc
+        JOIN instrument_master im ON im.ticker_id = phc.ticker_id
+        LEFT JOIN security_classification sc ON sc.ticker_id = im.ticker_id
+        LEFT JOIN market_cap mc ON mc.ticker_id = im.ticker_id
+        WHERE phc.interval = '1d' AND {universe_where} AND phc.date >= ? AND phc.date <= ?
+        ORDER BY im.ticker_id, phc.date
+    """
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        rows = conn.execute(query, universe_params + [start, as_of.isoformat()]).fetchall()
+    columns = [
+        "ticker_id", "ticker", "symbol", "company_name", "exchange", "isin", "sector", "industry",
+        "market_cap", "active", "date", "open", "high", "low", "close", "volume",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame([dict(row) for row in rows])
+    df["status"] = df["active"].map(lambda v: "Active" if v == 1 else ("Inactive" if v == 0 else "Unknown"))
+    return df.drop(columns=["active"])
+
+
+def get_scanner_benchmark_frame(*, as_of_date: str, lookback_days: int = 620, ticker: str = "^NSEI") -> pd.DataFrame:
+    """Bounded benchmark OHLCV (default Nifty 50) through as_of_date, for the scanner's
+    relative-strength calc -- same no-look-ahead date bound as get_scanner_price_frame()."""
+    as_of = date.fromisoformat(str(as_of_date))
+    start = (as_of - timedelta(days=lookback_days)).isoformat()
+    with _price_cache_connection() as conn:
+        _ensure_price_cache_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT date, open, high, low, close, volume
+            FROM price_history_cache phc
+            JOIN instrument_master im ON im.ticker_id = phc.ticker_id
+            WHERE phc.interval = '1d' AND im.ticker = ? AND phc.date >= ? AND phc.date <= ?
+            ORDER BY phc.date
+            """,
+            (ticker, start, as_of.isoformat()),
+        ).fetchall()
+    columns = ["date", "open", "high", "low", "close", "volume"]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame([dict(row) for row in rows])

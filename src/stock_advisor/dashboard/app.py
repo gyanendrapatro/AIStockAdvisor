@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
 from html import escape
+import csv
+import io
+import json
 import sys
 import threading
+import zipfile
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -30,19 +34,28 @@ from stock_advisor.analysis.market_analytics import (
 )
 from stock_advisor.analysis.pipeline import analyze_stock, rank_watchlist
 from stock_advisor.analysis.sector_rotation import list_sector_definitions, rank_sector_stocks
+from stock_advisor.analysis.turnaround_scanner import DEFAULT_SHORTLIST_THRESHOLDS, MODES, run_scanner
 from stock_advisor.agents.sector_rotation_workflow import run_sector_rotation_workflow
 from stock_advisor.agents.stock_research_agent import run_stock_research_agent
 from stock_advisor.config.settings import load_watchlists
 from stock_advisor.data.daily_refresh import load_daily_refresh_report, run_daily_market_data_refresh
 from stock_advisor.data.market_data import (
     CACHE_REFRESH_HINT,
+    INDEX_BACKFILL_DEFINITIONS,
+    SECTOR_TO_INDEX_NAME,
+    backfill_sector_benchmark_indices,
     backfill_shares_outstanding,
     fill_fundamentals_cache_for_universe,
     fill_price_cache_for_universe,
     get_price_cache_status,
     get_price_history,
+    get_scanner_benchmark_frame,
+    get_turnaround_export_coverage,
     list_all_instrument_master_tickers,
+    list_export_filter_options,
+    list_export_industries_for_sector,
     recompute_market_cap_from_shares_outstanding,
+    stream_ohlcv_export_rows,
     sync_instrument_master,
 )
 from stock_advisor.data.universe import list_sector_constituents, list_stock_universe
@@ -395,6 +408,81 @@ def _render_fundamentals_cache_fill_status() -> None:
             st.error(f"Fundamentals cache refresh failed: {ff_job.get('error')}")
 
 
+@st.cache_resource
+def _index_backfill_jobs() -> dict[str, dict[str, object]]:
+    return {}
+
+
+def _latest_index_backfill_job() -> dict[str, object] | None:
+    jobs = [job for job in _index_backfill_jobs().values() if job.get("scope") == "index_backfill"]
+    if not jobs:
+        return None
+    return sorted(jobs, key=lambda item: str(item.get("started_at") or ""), reverse=True)[0]
+
+
+def _start_index_backfill_job(*, start_date: str, end_date: str) -> dict[str, object]:
+    jobs = _index_backfill_jobs()
+    for job in jobs.values():
+        if job.get("scope") == "index_backfill" and job.get("status") == "running":
+            return job
+
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    job: dict[str, object] = {
+        "id": job_id,
+        "scope": "index_backfill",
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "progress": {"completed": 0, "total": 0},
+    }
+    jobs[job_id] = job
+
+    def _on_progress(completed: int, total: int) -> None:
+        job["progress"] = {"completed": completed, "total": total}
+
+    def _runner() -> None:
+        try:
+            result = backfill_sector_benchmark_indices(start_date=start_date, end_date=end_date, progress_callback=_on_progress)
+            job["status"] = "completed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["result"] = result
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = "failed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["error"] = str(exc)
+
+    threading.Thread(target=_runner, name=f"index-backfill-{job_id}", daemon=True).start()
+    return job
+
+
+@st.fragment
+def _render_index_backfill_status() -> None:
+    # Same fragment-scoping reason as _render_shares_outstanding_backfill_status above.
+    ib_col1, ib_col2 = st.columns(2)
+    ib_start = ib_col1.date_input("From", value=datetime(2024, 1, 1).date(), key="index_backfill_start")
+    ib_end = ib_col2.date_input("To", value=datetime.now(MARKET_TIMEZONE).date(), key="index_backfill_end")
+    ib_job = _latest_index_backfill_job()
+    ib_running = bool(ib_job and ib_job.get("status") == "running")
+    if st.button("Backfill sector & benchmark indices", key="index_backfill_button", disabled=ib_running):
+        _start_index_backfill_job(start_date=str(ib_start), end_date=str(ib_end))
+        ib_job = _latest_index_backfill_job()
+        ib_running = True
+    if ib_job:
+        ib_status = str(ib_job.get("status"))
+        if ib_status == "running":
+            ib_progress = ib_job.get("progress") or {}
+            st.info(f"Scanning NSE index archive... {ib_progress.get('completed', 0)}/{ib_progress.get('total', 0)} trading days")
+            st_autorefresh(interval=2500, limit=None, key="index_backfill_autorefresh")
+        elif ib_status == "completed":
+            ib_result = ib_job.get("result") or {}
+            st.success(
+                f"Done: {ib_result.get('indices_backfilled', 0)}/{ib_result.get('indices_targeted', 0)} indices, "
+                f"{ib_result.get('rows_written', 0)} rows written across "
+                f"{ib_result.get('trading_days_with_data', 0)}/{ib_result.get('trading_days_scanned', 0)} trading days."
+            )
+        elif ib_status == "failed":
+            st.error(f"Index backfill failed: {ib_job.get('error')}")
+
+
 with st.sidebar:
     st.subheader("Instrument Master")
     st.caption("Consolidate data/*.csv NSE/BSE universes into the instrument_master security table.")
@@ -449,6 +537,16 @@ with st.sidebar:
         "provider."
     )
     _render_fundamentals_cache_fill_status()
+
+    st.divider()
+    st.subheader("Sector & Benchmark Indices")
+    st.caption(
+        "One-time (re-runnable) backfill of Nifty 50/500/Midcap 100/Smallcap 100 plus ~18 NSE "
+        "sector indices into price_history_cache from NSE's official daily index-close archive, "
+        "so the Turnaround Scanner's relative-strength calc can stay local instead of fetching "
+        "live per scan. One HTTP request per trading day covers every index at once."
+    )
+    _render_index_backfill_status()
 
 
 st.markdown(
@@ -626,7 +724,7 @@ def _warn_if_cache_not_ready(
     return cache_readiness
 
 
-stock_tab, sector_tab, universe_tab, sector_analytics_tab, rrg_tab, industry_tab, indices_tab, breadth_tab, crossover_tab, gainers_tab = st.tabs(
+stock_tab, sector_tab, universe_tab, sector_analytics_tab, rrg_tab, industry_tab, indices_tab, breadth_tab, crossover_tab, gainers_tab, scanner_tab = st.tabs(
     [
         "Stock Scan",
         "Sector Rotation",
@@ -638,6 +736,7 @@ stock_tab, sector_tab, universe_tab, sector_analytics_tab, rrg_tab, industry_tab
         "Market Breadth",
         "MA Crossovers",
         "Top Gainers",
+        "Turnaround Scanner",
     ]
 )
 
@@ -3286,3 +3385,381 @@ with gainers_tab:
             st.info("No stocks met the top-gainer filter.")
     else:
         st.info("Run top gainers to identify stocks and industries with current momentum.")
+
+
+# ---------------------------------------------------------------------------
+# Turnaround Scanner helpers
+# ---------------------------------------------------------------------------
+# CSV/zip building for the "Turnaround Scanner" tab. Kept as plain module-level helpers (not
+# methods) to match this file's existing style (see _top_gainer_stock_frame etc.). The actual
+# scanning/scoring logic lives in analysis.turnaround_scanner -- this file only renders it and
+# shapes it into the Research Shortlist CSV / Research Pack zip.
+
+_EXPORT_APP_VERSION = "0.1.0"  # pyproject.toml [project].version
+_OHLCV_EXPORT_HEADER = ["symbol", "company_name", "exchange", "isin", "date", "open", "high", "low", "close", "adjusted_close", "volume"]
+
+_RESEARCH_SHORTLIST_HEADER = [
+    "symbol", "company_name", "exchange", "isin", "sector", "industry", "as_of_date", "stage", "turnaround_type",
+    "technical_score", "fundamental_score", "recognition_score", "early_opportunity_score",
+    "close", "adjusted_close", "dma20", "dma50", "dma200", "dma20_slope", "dma50_slope", "dma200_slope",
+    "return_5d", "return_1m", "return_3m", "return_6m", "return_12m",
+    "52w_high", "52w_low", "distance_from_52w_high", "distance_from_52w_low",
+    "volume", "avg_volume_20d", "volume_ratio_20d", "volume_trend",
+    "rs_1m", "rs_3m", "rs_6m", "sector_rs_3m",
+    "latest_crossover", "crossover_date", "fundamental_inflection", "earnings_acceleration",
+    "false_turnaround_flags", "data_quality_flags", "key_signal",
+]
+
+_RESULT_TABLE_SORT_COLUMNS = {
+    "Technical Score": "Technical Score",
+    "Fundamental Score": "Fundamental Score",
+    "Recognition Score": "Recognition Score",
+    "Early Opportunity Score": "Early Opportunity Score",
+    "1M Return": "1M",
+    "3M Return": "3M",
+    "6M Return": "6M",
+    "Relative Strength (3M)": "RS 3M",
+}
+
+
+def _export_num(value):
+    """Pass numeric export values through unchanged (no rounding) except for stripping a
+    trailing .0 off whole-number floats (every OHLCV/volume value from sqlite is a REAL, so
+    a plain volume of 12456321 would otherwise render as '12456321.0')."""
+    if value is None:
+        return ""
+    try:
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _ohlcv_row_values(row):
+    return [
+        row["symbol"] or "", row["company_name"] or "", row["exchange"] or "", row["isin"] or "", row["date"] or "",
+        _export_num(row["open"]), _export_num(row["high"]), _export_num(row["low"]), _export_num(row["close"]),
+        "",  # adjusted_close -- not available anywhere in this database
+        _export_num(row["volume"]),
+    ]
+
+
+def _stream_export_csv(header, chunk_iterable, row_builder):
+    """Write a chunked cursor export (stream_ohlcv_export_rows) straight into a csv.writer over
+    an in-memory buffer, one fetchmany() chunk at a time -- never materializes the full row set
+    or a pandas DataFrame, so a large candidate-OHLCV export doesn't pay double the memory
+    building an intermediate DataFrame before writing it out."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(header)
+    for chunk in chunk_iterable:
+        for row in chunk:
+            writer.writerow(row_builder(row))
+    return buffer.getvalue()
+
+
+def _format_flags_field(flags: dict) -> str:
+    """Only surfaces True / UNKNOWN entries (the informative ones) -- a flag that was actually
+    checked and found False is omitted rather than padding every row with 16 "=False" pairs."""
+    if not flags:
+        return ""
+    parts = [f"{k}={v}" for k, v in flags.items() if v is True or (isinstance(v, str) and v.startswith("UNKNOWN"))]
+    return "; ".join(parts)
+
+
+def _candidate_export_row(c: dict) -> list:
+    return [
+        c.get("symbol") or "", c.get("company_name") or "", c.get("exchange") or "", c.get("isin") or "",
+        c.get("sector") or "", c.get("industry") or "", c.get("as_of_date") or "", c.get("stage") or "", c.get("turnaround_type") or "",
+        _export_num(c.get("technical_score")), _export_num(c.get("fundamental_score")),
+        _export_num(c.get("recognition_score")), _export_num(c.get("early_opportunity_score")),
+        _export_num(c.get("close")), "",  # adjusted_close -- not available anywhere in this database
+        _export_num(c.get("dma20")), _export_num(c.get("dma50")), _export_num(c.get("dma200")),
+        _export_num(c.get("dma20_slope")), _export_num(c.get("dma50_slope")), _export_num(c.get("dma200_slope")),
+        _export_num(c.get("return_5d")), _export_num(c.get("return_1m")), _export_num(c.get("return_3m")),
+        _export_num(c.get("return_6m")), _export_num(c.get("return_12m")),
+        _export_num(c.get("high_52w")), _export_num(c.get("low_52w")),
+        _export_num(c.get("distance_from_52w_high")), _export_num(c.get("distance_from_52w_low")),
+        _export_num(c.get("volume")), _export_num(c.get("avg_volume_20d")), _export_num(c.get("volume_ratio_20d")),
+        _export_num(c.get("volume_trend")),
+        _export_num(c.get("rs_1m")), _export_num(c.get("rs_3m")), _export_num(c.get("rs_6m")), _export_num(c.get("sector_rs_3m")),
+        c.get("latest_crossover") or "", c.get("crossover_date") or "",
+        c.get("fundamental_inflection") or "", c.get("earnings_acceleration") or "",
+        _format_flags_field(c.get("false_turnaround_flags") or {}),
+        "; ".join(c.get("data_quality_flags") or []),
+        c.get("key_signal") or "",
+    ]
+
+
+def _build_research_shortlist_csv(shortlist: list[dict]) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(_RESEARCH_SHORTLIST_HEADER)
+    for candidate in shortlist:
+        writer.writerow(_candidate_export_row(candidate))
+    return buffer.getvalue()
+
+
+def _scanner_result_frame(rows: list[dict]) -> pd.DataFrame:
+    """Section 22's RESULT TABLE shape -- a narrower display view than the full CSV export."""
+    return pd.DataFrame(
+        [
+            {
+                "Symbol": r.get("symbol"),
+                "Company": r.get("company_name"),
+                "Stage": r.get("stage"),
+                "Technical Score": r.get("technical_score"),
+                "Fundamental Score": r.get("fundamental_score") if r.get("fundamental_score") is not None else "NOT AVAILABLE",
+                "Recognition Score": r.get("recognition_score"),
+                "Early Opportunity Score": r.get("early_opportunity_score") if r.get("early_opportunity_score") is not None else "NOT AVAILABLE",
+                "1M": r.get("return_1m"), "3M": r.get("return_3m"), "6M": r.get("return_6m"),
+                "20DMA": r.get("dma20"), "50DMA": r.get("dma50"), "200DMA": r.get("dma200"),
+                "Volume Ratio": r.get("volume_ratio_20d"), "RS 3M": r.get("rs_3m"),
+                "Key Signal": r.get("key_signal"),
+            }
+            for r in rows
+        ]
+    )
+
+
+def _sort_scanner_frame(df: pd.DataFrame, sort_choice: str) -> pd.DataFrame:
+    if df.empty or sort_choice not in _RESULT_TABLE_SORT_COLUMNS:
+        return df  # "Stage + Early Opportunity (default)" -- already sorted by run_scanner()
+    column = _RESULT_TABLE_SORT_COLUMNS[sort_choice]
+    numeric = pd.to_numeric(df[column], errors="coerce")
+    return df.assign(_sort=numeric).sort_values("_sort", ascending=False, na_position="last").drop(columns=["_sort"])
+
+
+def _build_benchmarks_frame(shortlist: list[dict], as_of_date: str, lookback_days: int) -> pd.DataFrame:
+    """Nifty 50 plus whichever sector indices the shortlist's own sectors actually map to --
+    only benchmarks that exist and are relevant, never the full 22-index set regardless of need."""
+    columns = ["benchmark_symbol", "benchmark_name", "benchmark_type", "date", "open", "high", "low", "close", "adjusted_close", "volume"]
+    used_sectors = {c.get("sector") for c in shortlist if c.get("sector")}
+    index_names = {"Nifty 50"} | {SECTOR_TO_INDEX_NAME[s] for s in used_sectors if s in SECTOR_TO_INDEX_NAME}
+    ticker_by_name = {name: ticker for name, ticker, _, _ in INDEX_BACKFILL_DEFINITIONS}
+    display_by_name = {name: display for name, _, display, _ in INDEX_BACKFILL_DEFINITIONS}
+    type_by_name = {name: btype for name, _, _, btype in INDEX_BACKFILL_DEFINITIONS}
+    frames = []
+    for name in index_names:
+        ticker = ticker_by_name.get(name)
+        if not ticker:
+            continue
+        idx_df = get_scanner_benchmark_frame(as_of_date=as_of_date, lookback_days=lookback_days, ticker=ticker)
+        if idx_df.empty:
+            continue
+        idx_df = idx_df.copy()
+        idx_df["benchmark_symbol"] = ticker
+        idx_df["benchmark_name"] = display_by_name.get(name, name)
+        idx_df["benchmark_type"] = type_by_name.get(name, "SECTOR_INDEX")
+        idx_df["adjusted_close"] = None
+        frames.append(idx_df[columns])
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=columns)
+
+
+def _build_research_pack_zip(result: dict) -> bytes:
+    """Section 25's Research Pack: candidate_summary.csv + candidate_ohlcv.csv (shortlisted
+    symbols only, min-history+buffer trading days through as-of-date -- never the whole
+    database) + benchmarks.csv + data_quality.json + scanner_parameters.json (Section 27's
+    reproducibility record), bundled as one zip since st.download_button serves one file per
+    click and this app has no XLSX support to fall back on instead."""
+    shortlist = result["shortlist"]
+    as_of_date = result["as_of_date"]
+    min_history_days = int(result["params"]["min_history_days"])
+    lookback_days = int(result["params"]["lookback_days"])
+    ohlcv_buffer_days = min(lookback_days, int((min_history_days + 250) * 1.6))  # trading days -> calendar-day buffer
+
+    candidate_summary_csv = _build_research_shortlist_csv(shortlist)
+
+    shortlist_symbols = [c["symbol"] for c in shortlist if c.get("symbol")]
+    ohlcv_start = (pd.Timestamp(as_of_date) - pd.Timedelta(days=ohlcv_buffer_days)).date().isoformat()
+    ohlcv_chunks = stream_ohlcv_export_rows(start_date=ohlcv_start, end_date=as_of_date, symbols=shortlist_symbols) if shortlist_symbols else iter(())
+    candidate_ohlcv_csv = _stream_export_csv(_OHLCV_EXPORT_HEADER, ohlcv_chunks, _ohlcv_row_values)
+
+    benchmarks_csv = _build_benchmarks_frame(shortlist, as_of_date, lookback_days).to_csv(index=False)
+
+    data_quality = {
+        "universe_count": result["universe_count"],
+        "scanned_count": result["scanned_count"],
+        "insufficient_history_count": result["insufficient_history_count"],
+        "invalid_ohlcv_rows_dropped": result["invalid_ohlcv_rows_dropped"],
+        "duplicate_listings_dropped": result["duplicate_listings_dropped"],
+        "benchmark_available": result["benchmark_available"],
+        "adjusted_price_available": False,
+        "candidate_count": len(result["candidates"]),
+        "shortlist_count": len(shortlist),
+    }
+    scanner_parameters = {
+        "scan_run_id": result["scan_run_id"],
+        "generated_at": result["generated_at"],
+        "as_of_date": as_of_date,
+        "mode": result["mode"],
+        "params": result["params"],
+        "app_version": _EXPORT_APP_VERSION,
+        "source": "data/advisor.sqlite",
+    }
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("candidate_summary.csv", candidate_summary_csv)
+        zf.writestr("candidate_ohlcv.csv", candidate_ohlcv_csv)
+        zf.writestr("benchmarks.csv", benchmarks_csv)
+        zf.writestr("data_quality.json", json.dumps(data_quality, indent=2, default=str))
+        zf.writestr("scanner_parameters.json", json.dumps(scanner_parameters, indent=2, default=str))
+    return zip_buffer.getvalue()
+
+
+with scanner_tab:
+    st.subheader("Turnaround Scanner")
+    st.caption(
+        "A local quantitative pre-filter for potential turnarounds -- Deterioration -> Stabilization -> "
+        "Fundamental Inflection -> Early Price Recognition -> Confirmation -> Re-rating -- prioritizing the "
+        "Stabilization/Inflection/Confirmation transition rather than stocks that have already re-rated. "
+        "This identifies stocks exhibiting technical/market characteristics consistent with a potential "
+        "turnaround; it is a research filter, not a buy/sell/best/worst recommendation, and fundamental/"
+        "management/valuation judgment belongs entirely to the separate research stage that consumes its "
+        "exported candidate list."
+    )
+
+    mode = st.radio("Scanner Mode", list(MODES), index=0, horizontal=True, key="scanner_mode",
+        help="EARLY: potential Stage 1-2 turnarounds (no 200DMA requirement -- catches early recovery "
+        "before full long-term confirmation). CONFIRMED: Stage 2-3 with a full moving-average stack and "
+        "200DMA confirmation. DEEP: broader, less restrictive filters for a larger research universe.")
+
+    if "scanner_coverage" not in st.session_state:
+        st.session_state["scanner_coverage"] = get_turnaround_export_coverage()
+    scanner_coverage = st.session_state["scanner_coverage"]
+    _scan_default_end = scanner_coverage.get("latest_date") or datetime.now(MARKET_TIMEZONE).strftime("%Y-%m-%d")
+    _scan_earliest = scanner_coverage.get("earliest_date") or "2024-01-01"
+
+    sc1, sc2, sc3 = st.columns(3)
+    backtest_mode = sc1.checkbox("Backtest / Historical Date", value=False, key="scanner_backtest_mode",
+        help="Off: always scans as of the latest available trading date. On: pick any historical as-of "
+        "date -- every calculation uses only information available on or before it (no look-ahead), for "
+        "validating the scanner's own past signals.")
+    st.session_state.setdefault("scanner_as_of_date", datetime.fromisoformat(_scan_default_end).date())
+    if backtest_mode:
+        as_of_date = sc2.date_input(
+            "As-of Date", key="scanner_as_of_date",
+            min_value=datetime.fromisoformat(_scan_earliest).date(), max_value=datetime.fromisoformat(_scan_default_end).date(),
+        )
+    else:
+        st.session_state["scanner_as_of_date"] = datetime.fromisoformat(_scan_default_end).date()
+        sc2.date_input("As-of Date", key="scanner_as_of_date", disabled=True)
+        as_of_date = st.session_state["scanner_as_of_date"]
+    min_history_days = sc3.number_input("Minimum history (trading days)", min_value=60, max_value=1000, value=250, step=10, key="scanner_min_history")
+
+    st.markdown("#### Universe")
+    if "scanner_filter_options" not in st.session_state:
+        st.session_state["scanner_filter_options"] = list_export_filter_options()
+    filter_options = st.session_state["scanner_filter_options"]
+
+    uf1, uf2, uf3 = st.columns(3)
+    scanner_exchanges = uf1.multiselect("Exchange", filter_options["exchanges"], default=[], key="scanner_exchanges")
+    scanner_sector_choice = uf2.selectbox("Sector", ["All"] + filter_options["sectors"], index=0, key="scanner_sector")
+    scanner_industry_options = list_export_industries_for_sector(None if scanner_sector_choice == "All" else scanner_sector_choice)
+    scanner_industry_choice = uf3.selectbox("Industry", ["All"] + scanner_industry_options, index=0, key="scanner_industry")
+
+    uf4, uf5, uf6 = st.columns(3)
+    scanner_cap_min = uf4.number_input("Market cap (Rs) >=", min_value=0.0, value=0.0, step=1e7, format="%.0f", key="scanner_cap_min")
+    scanner_cap_max = uf5.number_input("Market cap (Rs) <= (0 = no max)", min_value=0.0, value=0.0, step=1e7, format="%.0f", key="scanner_cap_max")
+    scanner_active_only = uf6.checkbox(
+        "Active only", value=False, key="scanner_active_only",
+        help="Off by default: delisted-but-still-catalogued securities stay in scope so backtests aren't "
+        "biased toward survivors. Tickers dropped from upstream source feeds before this database was "
+        "populated aren't recoverable either way -- this can reduce, not eliminate, survivorship bias.",
+    )
+    scanner_symbols_text = st.text_input(
+        "Selected symbols (comma-separated, optional -- leave blank for the full filtered universe)",
+        value="", key="scanner_symbols_text",
+    )
+    scanner_symbols = [s.strip().upper() for s in scanner_symbols_text.split(",") if s.strip()] or None
+
+    with st.expander("Research Shortlist thresholds", expanded=False):
+        st.caption("Section 23 defaults shown for the selected mode; adjust and re-run to change the shortlist.")
+        default_thresholds = DEFAULT_SHORTLIST_THRESHOLDS[mode]
+        min_tech_score = st.slider(
+            "Minimum Technical Score", min_value=0, max_value=100,
+            value=int(default_thresholds.get("min_technical_score", 50)), key=f"scanner_shortlist_ts_{mode}",
+        )
+        shortlist_thresholds = dict(default_thresholds)
+        shortlist_thresholds["min_technical_score"] = float(min_tech_score)
+
+    run_clicked = st.button("Run Scanner", key="scanner_run", type="primary", width="stretch")
+    if run_clicked:
+        with st.spinner(f"Running {mode} scan..."):
+            st.session_state["scanner_result"] = run_scanner(
+                mode=mode,
+                as_of_date=str(as_of_date),
+                exchanges=scanner_exchanges or None,
+                sector=None if scanner_sector_choice == "All" else scanner_sector_choice,
+                industry=None if scanner_industry_choice == "All" else scanner_industry_choice,
+                market_cap_min=scanner_cap_min if scanner_cap_min > 0 else None,
+                market_cap_max=scanner_cap_max if scanner_cap_max > 0 else None,
+                symbols=scanner_symbols,
+                active_only=scanner_active_only,
+                min_history_days=int(min_history_days),
+                shortlist_thresholds=shortlist_thresholds,
+            )
+            st.session_state.pop("scanner_research_pack", None)
+
+    result = st.session_state.get("scanner_result")
+    if not result:
+        st.info("Configure the scanner above and click Run Scanner.")
+    else:
+        st.markdown("#### Data Quality")
+        dq1, dq2, dq3, dq4 = st.columns(4)
+        dq1.metric("Universe", f"{result['universe_count']:,}")
+        dq2.metric("Scanned", f"{result['scanned_count']:,}")
+        dq3.metric("Insufficient history", f"{result['insufficient_history_count']:,}")
+        dq4.metric("Invalid OHLCV rows dropped", f"{result['invalid_ohlcv_rows_dropped']:,}")
+        dq5, dq6, dq7, dq8 = st.columns(4)
+        dq5.metric("Duplicate listings deduped", f"{result['duplicate_listings_dropped']:,}")
+        dq6.metric("Benchmark available", "Yes" if result["benchmark_available"] else "No")
+        dq7.metric(f"{result['mode']} candidates", f"{len(result['candidates']):,}")
+        dq8.metric("Research shortlist", f"{len(result['shortlist']):,}")
+        if not result["benchmark_available"]:
+            st.warning("Nifty 50 history isn't available for this as-of date/lookback window -- relative-strength fields will be blank for this run.")
+        st.caption(
+            "Adjusted prices: not available anywhere in this database (no adjusted_close column) -- every "
+            "moving-average/return/52-week calculation here uses raw close. Fundamental scoring is only "
+            "computed for candidates with >=4 consecutive non-null quarters of revenue+PAT (reporting-lag "
+            "gated so a quarter's figures are never used before they'd realistically be public); otherwise "
+            "fundamental_score/early_opportunity_score report NOT AVAILABLE -- never a fabricated number."
+        )
+
+        candidates = result["candidates"]
+        if not candidates:
+            st.info(f"No candidates matched the {result['mode']} scanner rules for this universe/date.")
+        else:
+            sort_choice = st.selectbox(
+                "Sort results by",
+                ["Stage + Early Opportunity (default)"] + list(_RESULT_TABLE_SORT_COLUMNS.keys()),
+                index=0, key="scanner_sort",
+            )
+            st.markdown(f"**Candidates: {len(candidates)}**")
+            st.dataframe(_sort_scanner_frame(_scanner_result_frame(candidates), sort_choice), width="stretch", hide_index=True)
+
+            shortlist = result["shortlist"]
+            st.markdown(f"**Deep Research Candidates (shortlist): {len(shortlist)}**")
+            if shortlist:
+                st.dataframe(_sort_scanner_frame(_scanner_result_frame(shortlist), sort_choice), width="stretch", hide_index=True)
+            else:
+                st.info("No candidates met the shortlist thresholds -- adjust them above or widen the universe/date range, then re-run.")
+
+            st.markdown("#### Export")
+            ex1, ex2 = st.columns(2)
+            ex1.download_button(
+                "Download Research Shortlist CSV", _build_research_shortlist_csv(shortlist),
+                file_name="research_shortlist.csv", mime="text/csv", width="stretch",
+                key="scanner_dl_shortlist", disabled=not shortlist,
+            )
+            if ex2.button("Build Research Pack", key="scanner_build_pack", width="stretch", disabled=not shortlist):
+                with st.spinner("Building Research Pack (candidate OHLCV + benchmarks + data quality + parameters)..."):
+                    st.session_state["scanner_research_pack"] = _build_research_pack_zip(result)
+            if "scanner_research_pack" in st.session_state:
+                ex2.download_button(
+                    "Download Research Pack (.zip)", st.session_state["scanner_research_pack"],
+                    file_name="turnaround_research_pack.zip", mime="application/zip",
+                    width="stretch", key="scanner_dl_pack",
+                )
