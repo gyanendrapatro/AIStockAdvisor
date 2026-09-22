@@ -5,6 +5,7 @@ __pycache__/
 .ruff_cache/
 .env
 /reports/
+/backtest_results/
 /data/*
 !/data/*.csv
 !/data/sectors/
